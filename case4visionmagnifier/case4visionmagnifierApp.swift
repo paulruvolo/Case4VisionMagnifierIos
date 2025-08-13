@@ -7,8 +7,26 @@
 
 import SwiftUI
 
+import SwiftUI
+import UIKit
+
+// 1) App delegate exposes a mutable orientation lock
+class AppDelegate: NSObject, UIApplicationDelegate {
+    static var orientationLock = UIInterfaceOrientationMask.all
+
+    func application(_ application: UIApplication,
+                     supportedInterfaceOrientationsFor window: UIWindow?)
+        -> UIInterfaceOrientationMask
+    {
+        Self.orientationLock
+    }
+}
+
+
 @main
 struct case4visionmagnifierApp: App {
+    @UIApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
+
     var body: some Scene {
         WindowGroup {
             ContentView()
