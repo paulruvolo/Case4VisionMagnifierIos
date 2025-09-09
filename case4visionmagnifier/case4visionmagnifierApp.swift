@@ -6,8 +6,6 @@
 //
 
 import SwiftUI
-
-import SwiftUI
 import UIKit
 
 // 1) App delegate exposes a mutable orientation lock

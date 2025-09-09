@@ -9,12 +9,15 @@
 import SwiftUI
 import AVFoundation
 import UIKit
+import Combine
 
 // MARK: - SwiftUI Camera View
 
 struct RearWideCameraView: View {
     @StateObject private var model = CameraModel()
     @State private var isFrozen = false
+    @State private var includeGuides = true
+
 
     var body: some View {
         ZStack {
@@ -34,6 +37,20 @@ struct RearWideCameraView: View {
                         .foregroundStyle(.secondary)
                 }
                 .task { await model.configure() }
+            }
+            if includeGuides {
+                GeometryReader { geo in
+                    Rectangle()
+                        .fill(Color.red)
+                        .frame(width: geo.size.width, height: 10)
+                        .position(x: geo.size.width/2, y: 100)
+                    
+                    Rectangle()
+                        .fill(Color.red)
+                        .frame(width: geo.size.width, height: 10)
+                        .position(x: geo.size.width/2, y: geo.size.height-100)
+                }
+                .ignoresSafeArea()
             }
         }
         .alert(item: $model.alert) { alert in
@@ -75,6 +92,8 @@ struct CameraPreview: UIViewRepresentable {
         scroll.showsHorizontalScrollIndicator = false
         scroll.backgroundColor = .black
         scroll.delegate = context.coordinator
+        
+        scroll.isScrollEnabled = false
 
         // Container so both preview and overlay zoom together
         let container = UIView()
@@ -107,15 +126,19 @@ struct CameraPreview: UIViewRepresentable {
         // Ensure we have a video output to grab latest frames for freezing
         context.coordinator.ensureVideoOutputOnSession()
 
-        // Center content initially
-        context.coordinator.centerContent()
+        scroll.contentSize = container.bounds.size
+        
+        // Initial recenter after the first layout pass
+        DispatchQueue.main.async {
+            context.coordinator.centerContent()
+            context.coordinator.lockContentOffsetToCenter()
+        }
 
         return scroll
     }
 
     func updateUIView(_ scroll: UIScrollView, context: Context) {
         context.coordinator.applyFreeze(isFrozen)
-        // Keep content centered if bounds changed
         context.coordinator.centerContent()
     }
 
@@ -203,6 +226,18 @@ struct CameraPreview: UIViewRepresentable {
                 overlay.isHidden = true
                 preview.isHidden = false
             }
+            // ⬇️ Recenter after the visibility change, even if no zoom yet.
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self, let scroll = self.scrollView else { return }
+                scroll.layoutIfNeeded()
+                self.centerContent()
+                self.lockContentOffsetToCenter()
+                let z = scroll.zoomScale
+                scroll.setZoomScale(z * 1.0001, animated: false)
+                scroll.setZoomScale(z, animated: false)
+                self.centerContent()
+                self.lockContentOffsetToCenter()
+            }
         }
 
         // Fallback snapshot if no video frame was captured yet
@@ -218,14 +253,32 @@ struct CameraPreview: UIViewRepresentable {
 
         func viewForZooming(in scrollView: UIScrollView) -> UIView? { container }
 
-        func scrollViewDidZoom(_ scrollView: UIScrollView) { centerContent() }
-
+        func scrollViewDidZoom(_ scrollView: UIScrollView) {
+            centerContent()
+            lockContentOffsetToCenter()
+        }
+        
+        // Center the zoomed content using insets (works when content is smaller than bounds)
         func centerContent() {
-            guard let scroll = scrollView, let view = container else { return }
-            let offsetX = max((scroll.bounds.width  - scroll.contentSize.width)  * 0.5, 0)
-            let offsetY = max((scroll.bounds.height - scroll.contentSize.height) * 0.5, 0)
-            view.center = CGPoint(x: scroll.contentSize.width  * 0.5 + offsetX,
-                                  y: scroll.contentSize.height * 0.5 + offsetY)
+            guard let scroll = scrollView else { return }
+            // If you rely on contentSize == container.bounds.size this stays correct.
+            let contentSize = scroll.contentSize
+            let dx = max(0, (scroll.bounds.width  - contentSize.width)  / 2)
+            let dy = max(0, (scroll.bounds.height - contentSize.height) / 2)
+            scroll.contentInset = UIEdgeInsets(top: dy, left: dx, bottom: dy, right: dx)
+        }
+
+        // Keep the visual center fixed; prevents any drift while zooming
+        func lockContentOffsetToCenter() {
+            guard let scroll = scrollView else { return }
+            let contentSize = scroll.contentSize
+            let target = CGPoint(
+                x: max(0, (contentSize.width  - scroll.bounds.width ) / 2) - scroll.adjustedContentInset.left,
+                y: max(0, (contentSize.height - scroll.bounds.height) / 2) - scroll.adjustedContentInset.top
+            )
+            if scroll.contentOffset != target {
+                scroll.setContentOffset(target, animated: false)
+            }
         }
     }
 }
