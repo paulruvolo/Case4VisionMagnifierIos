@@ -63,9 +63,80 @@ struct RearWideCameraView: View {
     }
 }
 
+//final class PreviewView: UIView {
+//    override class var layerClass: AnyClass { AVCaptureVideoPreviewLayer.self }
+//    var videoPreviewLayer: AVCaptureVideoPreviewLayer { layer as! AVCaptureVideoPreviewLayer
+//    }
+//}
+
 final class PreviewView: UIView {
-    override class var layerClass: AnyClass { AVCaptureVideoPreviewLayer.self }
-    var videoPreviewLayer: AVCaptureVideoPreviewLayer { layer as! AVCaptureVideoPreviewLayer
+
+    // Use a plain CALayer so we can set `.contents`
+    override class var layerClass: AnyClass { CALayer.self }
+
+    private let ciContext = CIContext() // Metal-backed by default
+    private let displayQueue = DispatchQueue(label: "PreviewView.display", qos: .userInitiated)
+
+    /// Forward to underlying CALayer for convenience
+    var contentsGravity: CALayerContentsGravity {
+        get { (layer as! CALayer).contentsGravity }
+        set { (layer as! CALayer).contentsGravity = newValue }
+    }
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        (layer as! CALayer).contentsGravity = .resizeAspectFill
+        (layer as! CALayer).isGeometryFlipped = false
+        (layer as! CALayer).masksToBounds = true
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        (layer as! CALayer).contentsGravity = .resizeAspectFill
+        (layer as! CALayer).isGeometryFlipped = false
+        (layer as! CALayer).masksToBounds = true
+    }
+
+    /// Display a CIImage (fastest path when you already have CIImage)
+    func display(ciImage: CIImage, oriented orientation: CGImagePropertyOrientation = .right) {
+        let image = ciImage.oriented(orientation)
+        renderAndSetContents(ciImage: image)
+    }
+
+    /// Display a CVPixelBuffer
+    func display(pixelBuffer: CVPixelBuffer, oriented orientation: CGImagePropertyOrientation = .right) {
+        let ciImage = CIImage(cvPixelBuffer: pixelBuffer).oriented(orientation)
+        renderAndSetContents(ciImage: ciImage)
+    }
+
+    /// Display a CGImage (if you already converted upstream)
+    func display(cgImage: CGImage) {
+        // Setting .contents must occur on main; disable implicit animations to avoid flicker
+        DispatchQueue.main.async {
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            (self.layer as! CALayer).contents = cgImage
+            CATransaction.commit()
+        }
+    }
+
+    // MARK: - Private
+
+    private func renderAndSetContents(ciImage: CIImage) {
+        // Render off the main thread, then set .contents on the main thread.
+        displayQueue.async {
+            let rect = ciImage.extent
+            // Use sRGB color space to avoid washed out colors
+            let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)
+            guard let cgImage = self.ciContext.createCGImage(ciImage, from: rect, format: .RGBA8, colorSpace: colorSpace) else { return }
+
+            DispatchQueue.main.async {
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                (self.layer as! CALayer).contents = cgImage
+                CATransaction.commit()
+            }
+        }
     }
 }
 
@@ -96,9 +167,9 @@ struct CameraPreview: UIViewRepresentable {
         let preview = PreviewView()
         preview.frame = container.bounds
         preview.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-        preview.videoPreviewLayer.session = session
-        preview.videoPreviewLayer.videoGravity = .resizeAspectFill
-        preview.videoPreviewLayer.connection?.videoOrientation = .landscapeRight
+//        preview.videoPreviewLayer.session = session
+//        preview.videoPreviewLayer.videoGravity = .resizeAspectFill
+//        preview.videoPreviewLayer.connection?.videoOrientation = .landscapeRight
         container.addSubview(preview)
         // Frozen overlay (hidden by default)
         let overlay = UIImageView(frame: container.bounds)
@@ -141,6 +212,7 @@ struct CameraPreview: UIViewRepresentable {
         private let motion = CMMotionManager()
         private(set) var gravity: CMAcceleration?
         private var K: simd_float3x3?
+        private var processingFrame = false
         // camera intrinsics (pixels)
         private let ciCtx = CIContext(options: nil)
         // ---- MOTION ----
@@ -203,15 +275,38 @@ struct CameraPreview: UIViewRepresentable {
                 K = simd_float3x3(rows: [ SIMD3(f, 0, w/2), SIMD3(0, f, h/2), SIMD3(0, 0, 1) ])
             }
         }
+        func downscaledImage(_ img: CIImage,
+                             maxLongEdge: CGFloat = 1920,
+                             maxTotalPixels: CGFloat = 2_000_000) -> CIImage {
+            let w = img.extent.width
+            let h = img.extent.height
+            guard w > 0, h > 0 else { return img }
+
+            // Long-edge cap
+            let s1 = maxLongEdge / max(w, h)
+
+            // Total-pixels cap
+            let s2 = sqrt(maxTotalPixels / (w * h))
+
+            // Only downscale (never upscale)
+            let s = min(1.0, s1, s2)
+
+            if s >= 0.999 { return img } // already small enough
+
+            // Lanczos downscale (higher quality than affine)
+            return img.applyingFilter("CILanczosScaleTransform",
+                                      parameters: ["inputScale": s,
+                                                   "inputAspectRatio": 1.0])
+        }
         // ---- RECTIFY (gravity-leveling) ----
-        func rectifyToLevel(_ uiImage: UIImage, interfaceOrientation: UIInterfaceOrientation) -> UIImage? {
+        func rectifyToLevel(_ uiImage: UIImage, interfaceOrientation: UIInterfaceOrientation) -> CGImage? {
             guard let cg = uiImage.cgImage, let gravity = gravity else {
                 return nil
             }
             let ci = CIImage(cgImage: cg) // already oriented .up in your code
             let r = ci.extent
             guard let K = self.K else {
-                return uiImage
+                return nil
             }
             // If intrinsics missing, just return input
             // Map device pitch/roll to view axes
@@ -237,10 +332,21 @@ struct CameraPreview: UIViewRepresentable {
             f.setValue(CIVector(cgPoint: tr), forKey: "inputTopRight")
             f.setValue(CIVector(cgPoint: br), forKey: "inputBottomRight")
             f.setValue(CIVector(cgPoint: bl), forKey: "inputBottomLeft")
-            guard let out = f.outputImage, let outCG = ciCtx.createCGImage(out, from: out.extent) else {
+
+            guard var out = f.outputImage else { return nil }
+
+            // 1) Crop to the tight bounding rect
+            out = out.cropped(to: out.extent.integral)
+
+            // 2) Downscale to your cap(s)
+            out = downscaledImage(out, maxLongEdge: 1920, maxTotalPixels: 2_000_000)
+
+            // 3) Render
+            guard let outCG = ciCtx.createCGImage(out, from: out.extent) else {
                 return nil
             }
-            return UIImage(cgImage: outCG, scale: uiImage.scale, orientation: .up)
+            return outCG
+            //return UIImage(cgImage: outCG, scale: uiImage.scale, orientation: .up)
         }
         // ---- Helpers ----
         private func viewAlignedAngles(pitch: Float, roll: Float, io: UIInterfaceOrientation) -> (rx: Float, ry: Float) {
@@ -290,19 +396,36 @@ struct CameraPreview: UIViewRepresentable {
         }
         // Convert frames to UIImage and keep only the latest
         func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
-            guard let pb = CMSampleBufferGetImageBuffer(sampleBuffer) else {
+            guard !processingFrame else {
                 return
             }
-            updateIntrinsicsIfNeeded(from: pb)
-            let ci = CIImage(cvPixelBuffer: pb)
-            // Create CGImage and orient it to match the preview
-            guard let cg = ciContext.createCGImage(ci, from: ci.extent) else {
-                return
+            processingFrame = true
+            DispatchQueue.global(qos: .userInteractive).async {
+                print("deciding to process")
+                guard let pb = CMSampleBufferGetImageBuffer(sampleBuffer) else {
+                    self.processingFrame = false
+                    return
+                }
+                self.updateIntrinsicsIfNeeded(from: pb)
+                let ci = CIImage(cvPixelBuffer: pb)
+                // Create CGImage and orient it to match the preview
+                guard let cg = self.ciContext.createCGImage(ci, from: ci.extent) else {
+                    self.processingFrame = false
+                    return
+                }
+                
+                let oriented: UIImage.Orientation = .right
+                // landscapeRight
+                let image = UIImage(cgImage: cg, scale: 1, orientation: oriented)
+                self.latestImage = image
+                // Ensure .up orientation
+                let upright = UIImage(cgImage: image.cgImage!, scale: image.scale, orientation: .up)
+                if let leveled = self.rectifyToLevel(upright, interfaceOrientation: .landscapeRight)  {
+                    self.preview?.display(cgImage:leveled)
+                }
+                self.processingFrame = false
+                print("done processing")
             }
-            let oriented: UIImage.Orientation = .right
-            // landscapeRight
-            let image = UIImage(cgImage: cg, scale: 1, orientation: oriented)
-            latestImage = image
         }
         // Toggle frozen state
         func applyFreeze(_ frozen: Bool) {
@@ -320,10 +443,12 @@ struct CameraPreview: UIViewRepresentable {
                 // Ensure .up orientation
                 let upright = UIImage(cgImage: imageToRotate.cgImage!, scale: imageToRotate.scale, orientation: .up)
                 let io = overlay.window?.windowScene?.interfaceOrientation ?? .landscapeRight
-                let leveled = rectifyToLevel(upright, interfaceOrientation: io) ?? upright
-                overlay.image = leveled
-                overlay.isHidden = false
-                preview.isHidden = true
+                if let leveled = rectifyToLevel(upright, interfaceOrientation: io) {
+                    let leveledUIImage = UIImage(cgImage: leveled)
+                    overlay.image = leveledUIImage
+                    overlay.isHidden = false
+                    preview.isHidden = true
+                }
             } else {
                 overlay.isHidden = true
                 preview.isHidden = false
