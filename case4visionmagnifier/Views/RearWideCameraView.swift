@@ -15,7 +15,7 @@ import CoreImage
 struct RearWideCameraView: View {
     @StateObject private var model = CameraModel()
     @State private var isFrozen = false
-    @State private var includeGuides = true
+    @State private var includeGuides = false
     var body: some View {
         ZStack {
             if let session = model.session {
@@ -23,10 +23,55 @@ struct RearWideCameraView: View {
                     .ignoresSafeArea()
                     .onAppear { model.start() }
                     .onDisappear { model.stop() }
-                Button(isFrozen ? "Unfreeze" : "Freeze") {
-                    isFrozen.toggle()
-                }.buttonStyle(.borderedProminent)
-                    .padding()
+                VStack {
+                    HStack {
+                        Button(isFrozen ? "Unfreeze" : "Freeze") {
+                            isFrozen.toggle()
+                        }.buttonStyle(.borderedProminent)
+                        Spacer()
+                        Button("Color Filter") {
+                            print("Top Right tapped")
+                        }.buttonStyle(.borderedProminent)
+                    }
+                    Spacer()
+                    HStack {
+                        Button("Toggle Flash Light") {
+                            guard let videoInput = session.inputs
+                                .compactMap({ $0 as? AVCaptureDeviceInput })
+                                .first(where: { $0.device.hasMediaType(.video) }),
+                                  videoInput.device.hasTorch else {
+                                return
+                                // e.g., toggle torch or adjust focus
+                            }
+                            let device = videoInput.device
+                            if device.torchMode == .off {
+                                do {
+                                    try device.lockForConfiguration()
+                                    try device.setTorchModeOn(level: 1.0)
+                                    device.unlockForConfiguration()
+                                } catch {
+                                    device.unlockForConfiguration()
+                                    print("torch error")
+                                }
+                            } else if device.torchMode == .on {
+                                do {
+                                    try device.lockForConfiguration()
+                                    device.torchMode = .off
+                                    device.unlockForConfiguration()
+                                } catch {
+                                    device.unlockForConfiguration()
+                                    print("torch error")
+                                }
+                            }
+                        }.buttonStyle(.borderedProminent)
+                        Spacer()
+                        Button("Toggle Guide Lines") {
+                            includeGuides.toggle()
+                        }.buttonStyle(.borderedProminent)
+                    }
+                }
+                .padding() // space from edges
+               
             } else {
                 VStack(spacing: 12) {
                     ProgressView()
@@ -79,22 +124,22 @@ final class PreviewView: UIView {
 
     /// Forward to underlying CALayer for convenience
     var contentsGravity: CALayerContentsGravity {
-        get { (layer as! CALayer).contentsGravity }
-        set { (layer as! CALayer).contentsGravity = newValue }
+        get { layer.contentsGravity }
+        set { layer.contentsGravity = newValue }
     }
 
     override init(frame: CGRect) {
         super.init(frame: frame)
-        (layer as! CALayer).contentsGravity = .resizeAspectFill
-        (layer as! CALayer).isGeometryFlipped = false
-        (layer as! CALayer).masksToBounds = true
+        layer.contentsGravity = .resizeAspectFill
+        layer.isGeometryFlipped = false
+        layer.masksToBounds = true
     }
 
     required init?(coder: NSCoder) {
         super.init(coder: coder)
-        (layer as! CALayer).contentsGravity = .resizeAspectFill
-        (layer as! CALayer).isGeometryFlipped = false
-        (layer as! CALayer).masksToBounds = true
+        layer.contentsGravity = .resizeAspectFill
+        layer.isGeometryFlipped = false
+        layer.masksToBounds = true
     }
 
     /// Display a CIImage (fastest path when you already have CIImage)
@@ -104,8 +149,8 @@ final class PreviewView: UIView {
     }
 
     /// Display a CVPixelBuffer
-    func display(pixelBuffer: CVPixelBuffer, oriented orientation: CGImagePropertyOrientation = .right) {
-        let ciImage = CIImage(cvPixelBuffer: pixelBuffer).oriented(orientation)
+    func display(pixelBuffer: CVPixelBuffer) {
+        let ciImage = CIImage(cvPixelBuffer: pixelBuffer).oriented(.right)
         renderAndSetContents(ciImage: ciImage)
     }
 
@@ -115,7 +160,7 @@ final class PreviewView: UIView {
         DispatchQueue.main.async {
             CATransaction.begin()
             CATransaction.setDisableActions(true)
-            (self.layer as! CALayer).contents = cgImage
+            self.layer.contents = cgImage
             CATransaction.commit()
         }
     }
@@ -133,7 +178,7 @@ final class PreviewView: UIView {
             DispatchQueue.main.async {
                 CATransaction.begin()
                 CATransaction.setDisableActions(true)
-                (self.layer as! CALayer).contents = cgImage
+                self.layer.contents = cgImage
                 CATransaction.commit()
             }
         }
@@ -211,31 +256,30 @@ struct CameraPreview: UIViewRepresentable {
         private var latestImage: UIImage?
         private let motion = CMMotionManager()
         private(set) var gravity: CMAcceleration?
+        // camera intrinsics (pixels)
         private var K: simd_float3x3?
         private var processingFrame = false
-        // camera intrinsics (pixels)
         private let ciCtx = CIContext(options: nil)
-        // ---- MOTION ----
+        
+        
+        /// Start motion updates so we can access the gravity vector
         func startMotion() {
             guard motion.isDeviceMotionAvailable else {
                 return
             }
             motion.deviceMotionUpdateInterval = 1/60
             motion.startDeviceMotionUpdates(using: .xArbitraryZVertical, to: .main) { [weak self] dm, _ in
-                guard let self, let dm, let K = K else {
+                guard let self, let dm else {
                     return
                 }
-                //warp.updateHomography(from: dm.gravity, K: K)
                 self.gravity = dm.gravity
-                print("gravity \(dm.gravity)")
             }
         }
         
-        func stopMotion() {
-            motion.stopDeviceMotionUpdates()
-        }
         
-        // ---- INTRINSICS (try real, else approximate) ----
+        /// Pulls the camera intrinsics from the pixel buffer.  The intrinsics are needed to compute the
+        /// homography that corrects for the pitch and roll of the phone.
+        /// - Parameter pixelBuffer: the image that is being perspective corrected (e.g., from the camera feed)
         private func updateIntrinsicsIfNeeded(from pixelBuffer: CVPixelBuffer) {
             guard K == nil else {
                 return
@@ -243,8 +287,8 @@ struct CameraPreview: UIViewRepresentable {
             // Try CVImageBuffer attachment first
             if let att = CMGetAttachment(pixelBuffer, key: kCMSampleBufferAttachmentKey_CameraIntrinsicMatrix as CFString, attachmentModeOut: nil) {
                 if let data = att as? Data, data.count >= MemoryLayout<Float>.size * 9 { let f = data.withUnsafeBytes {
-                    $0.bindMemory(to: Float.self)
-                }
+                        $0.bindMemory(to: Float.self)
+                    }
                     // Row-major 3x3
                     K = simd_float3x3(rows: [ SIMD3(f[0], f[1], f[2]), SIMD3(f[3], f[4], f[5]), SIMD3(f[6], f[7], f[8]) ])
                     return
@@ -275,94 +319,97 @@ struct CameraPreview: UIViewRepresentable {
                 K = simd_float3x3(rows: [ SIMD3(f, 0, w/2), SIMD3(0, f, h/2), SIMD3(0, 0, 1) ])
             }
         }
-        func downscaledImage(_ img: CIImage,
-                             maxLongEdge: CGFloat = 1920,
-                             maxTotalPixels: CGFloat = 2_000_000) -> CIImage {
-            let w = img.extent.width
-            let h = img.extent.height
-            guard w > 0, h > 0 else { return img }
-
-            // Long-edge cap
-            let s1 = maxLongEdge / max(w, h)
-
-            // Total-pixels cap
-            let s2 = sqrt(maxTotalPixels / (w * h))
-
-            // Only downscale (never upscale)
-            let s = min(1.0, s1, s2)
-
-            if s >= 0.999 { return img } // already small enough
-
-            // Lanczos downscale (higher quality than affine)
-            return img.applyingFilter("CILanczosScaleTransform",
-                                      parameters: ["inputScale": s,
-                                                   "inputAspectRatio": 1.0])
-        }
-        // ---- RECTIFY (gravity-leveling) ----
-        func rectifyToLevel(_ uiImage: UIImage, interfaceOrientation: UIInterfaceOrientation) -> CGImage? {
-            guard let cg = uiImage.cgImage, let gravity = gravity else {
-                return nil
-            }
-            let ci = CIImage(cgImage: cg) // already oriented .up in your code
-            let r = ci.extent
-            guard let K = self.K else {
-                return nil
-            }
-            // If intrinsics missing, just return input
-            // Map device pitch/roll to view axes
-            let gravityVectorInCameraConventions = simd_float3(Float(gravity.y), Float(-gravity.x), Float(-gravity.z))
-            print(gravityVectorInCameraConventions)
-            let R = simd_float3x3(simd_quatf(from: simd_float3(0, 0, 1), to: gravityVectorInCameraConventions))
-            let H = K * R * simd_inverse(K)
-            // Map the 4 corners through H (Core Image coords: origin at bottom-left)
+        
+        func applyHomographyToImage(ci: CIImage, H: simd_float3x3)->CIImage? {
+            // Map via H (Core Image coords: origin at bottom-left)
             func map(_ p: CGPoint) -> CGPoint {
                 let v = SIMD3(Float(p.x), Float(p.y), 1)
                 let w = H * v
                 return CGPoint(x: CGFloat(w.x / w.z), y: CGFloat(w.y / w.z))
             }
+            let r = ci.extent
+            let targetRect = r
             let bl = map(CGPoint(x: r.minX, y: r.minY))
             let br = map(CGPoint(x: r.maxX, y: r.minY))
             let tl = map(CGPoint(x: r.minX, y: r.maxY))
             let tr = map(CGPoint(x: r.maxX, y: r.maxY))
-            guard let f = CIFilter(name: "CIPerspectiveTransform") else {
+
+            // 1) Compute the bounding box of the warped quad
+            let xs = [tl.x, tr.x, br.x, bl.x]
+            let ys = [tl.y, tr.y, br.y, bl.y]
+            let minX = xs.min()!, maxX = xs.max()!
+            let minY = ys.min()!, maxY = ys.max()!
+            let bbox = CGRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
+
+            // 2) Build a normalization that places the quad inside targetRect
+            let tx = -bbox.minX
+            let ty = -bbox.minY
+            let sxFill = targetRect.width  / bbox.width
+            let syFill = targetRect.height / bbox.height
+
+            let (sx, sy, padX, padY): (CGFloat, CGFloat, CGFloat, CGFloat)
+            // Uniform scale (preserve aspect). Center with padding.
+            let s = min(sxFill, syFill)
+            sx = s; sy = s
+            padX = (targetRect.width  - bbox.width  * s) * 0.5
+            padY = (targetRect.height - bbox.height * s) * 0.5
+            // Apply: translate to origin -> scale -> translate into targetRect
+            func norm(_ p: CGPoint) -> CGPoint {
+                let x = (p.x + tx) * sx + targetRect.minX + padX
+                let y = (p.y + ty) * sy + targetRect.minY + padY
+                return CGPoint(x: x, y: y)
+            }
+
+            let TL = norm(tl)
+            let TR = norm(tr)
+            let BR = norm(br)
+            let BL = norm(bl)
+
+            // 3) Use CIPerspectiveTransformWithExtent so the OUTPUT extent is fixed
+            guard let f = CIFilter(name: "CIPerspectiveTransformWithExtent") else {
                 return nil
             }
             f.setValue(ci, forKey: kCIInputImageKey)
-            f.setValue(CIVector(cgPoint: tl), forKey: "inputTopLeft")
-            f.setValue(CIVector(cgPoint: tr), forKey: "inputTopRight")
-            f.setValue(CIVector(cgPoint: br), forKey: "inputBottomRight")
-            f.setValue(CIVector(cgPoint: bl), forKey: "inputBottomLeft")
-
-            guard var out = f.outputImage else { return nil }
-
-            // 1) Crop to the tight bounding rect
-            out = out.cropped(to: out.extent.integral)
-
-            // 2) Downscale to your cap(s)
-            out = downscaledImage(out, maxLongEdge: 1920, maxTotalPixels: 2_000_000)
-
-            // 3) Render
+            f.setValue(CIVector(cgRect: targetRect), forKey: "inputExtent")
+            f.setValue(CIVector(cgPoint: TL), forKey: "inputTopLeft")
+            f.setValue(CIVector(cgPoint: TR), forKey: "inputTopRight")
+            f.setValue(CIVector(cgPoint: BR), forKey: "inputBottomRight")
+            f.setValue(CIVector(cgPoint: BL), forKey: "inputBottomLeft")
+            return f.outputImage
+        }
+        
+        /// Adjust the UIImage based on the gravity vector as returned by the CoreMotion.
+        /// We assume a landscape right orientation for the image
+        /// - Parameters:
+        ///   - uiImage: the UIImage (e.g., from the camera feed or a freeze frame)
+        /// - Returns: the corrected CGImage if the transformation can be applied successfully (nil otherwise)
+        func rectifyToLevel(_ uiImage: UIImage) -> CGImage? {
+            guard let cg = uiImage.cgImage, let gravity = gravity else {
+                return nil
+            }
+            let ci = CIImage(cgImage: cg)
+            guard let K = self.K else {
+                // If intrinsics missing, just return input
+                return nil
+            }
+            let gravityVectorInCameraConventions = simd_float3(Float(gravity.y), Float(-gravity.x), Float(-gravity.z))
+            let R = simd_float3x3(simd_quatf(from: simd_float3(0, 0, 1), to: gravityVectorInCameraConventions))
+            let H = K * R * simd_inverse(K)
+            // correct for perspective
+            guard let out = applyHomographyToImage(ci: ci, H: H) else {
+                return nil
+            }
+            // the output as a CGImage
             guard let outCG = ciCtx.createCGImage(out, from: out.extent) else {
                 return nil
             }
             return outCG
-            //return UIImage(cgImage: outCG, scale: uiImage.scale, orientation: .up)
         }
-        // ---- Helpers ----
-        private func viewAlignedAngles(pitch: Float, roll: Float, io: UIInterfaceOrientation) -> (rx: Float, ry: Float) {
-            switch io {
-            case .landscapeRight: return (rx: pitch, ry: -roll)
-            case .landscapeLeft: return (rx: -pitch, ry: roll)
-            case .portrait: return (rx: roll, ry: pitch)
-            case .portraitUpsideDown: return (rx: -roll, ry: -pitch)
-            default:
-                return (rx: roll, ry: pitch)
-                // fallback
-            }
-        }
+
         init(session: AVCaptureSession) {
             self.session = session
         }
+        
         // Add (or reuse) a VideoDataOutput so we can grab the latest frame as UIImage
         func ensureVideoOutputOnSession() {
             guard let session = session else {
@@ -394,14 +441,15 @@ struct CameraPreview: UIViewRepresentable {
                 }
             }
         }
+        
         // Convert frames to UIImage and keep only the latest
         func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+            // We are careful not to process frames too slowly, so we discard frames if we are still processing a previous frame
             guard !processingFrame else {
                 return
             }
             processingFrame = true
             DispatchQueue.global(qos: .userInteractive).async {
-                print("deciding to process")
                 guard let pb = CMSampleBufferGetImageBuffer(sampleBuffer) else {
                     self.processingFrame = false
                     return
@@ -420,20 +468,19 @@ struct CameraPreview: UIViewRepresentable {
                 self.latestImage = image
                 // Ensure .up orientation
                 let upright = UIImage(cgImage: image.cgImage!, scale: image.scale, orientation: .up)
-                if let leveled = self.rectifyToLevel(upright, interfaceOrientation: .landscapeRight)  {
+                if let leveled = self.rectifyToLevel(upright)  {
                     self.preview?.display(cgImage:leveled)
                 }
                 self.processingFrame = false
-                print("done processing")
             }
         }
+        
         // Toggle frozen state
         func applyFreeze(_ frozen: Bool) {
             guard let overlay, let preview else {
                 return
             }
             if frozen {
-                // Prefer camera frame; if not available, fall back to a view snapshot
                 let imageToRotate: UIImage
                 if let img = latestImage {
                     imageToRotate = img
@@ -441,9 +488,10 @@ struct CameraPreview: UIViewRepresentable {
                     imageToRotate = fallbackSnapshot(of: preview)!
                 }
                 // Ensure .up orientation
-                let upright = UIImage(cgImage: imageToRotate.cgImage!, scale: imageToRotate.scale, orientation: .up)
-                let io = overlay.window?.windowScene?.interfaceOrientation ?? .landscapeRight
-                if let leveled = rectifyToLevel(upright, interfaceOrientation: io) {
+                let upright = UIImage(cgImage: imageToRotate.cgImage!,
+                                      scale: imageToRotate.scale,
+                                      orientation: .up)
+                if let leveled = rectifyToLevel(upright) {
                     let leveledUIImage = UIImage(cgImage: leveled)
                     overlay.image = leveledUIImage
                     overlay.isHidden = false
@@ -453,7 +501,7 @@ struct CameraPreview: UIViewRepresentable {
                 overlay.isHidden = true
                 preview.isHidden = false
             }
-            // ⬇️ Recenter after the visibility change, even if no zoom yet.
+            // Recenter after the visibility change, even if no zoom yet.
             DispatchQueue.main.async { [weak self] in
                 guard let self = self, let scroll = self.scrollView else {
                     return
@@ -514,6 +562,7 @@ final class CameraModel: ObservableObject {
     @Published var session: AVCaptureSession?
     @Published var alert: CameraAlert?
     private let sessionQueue = DispatchQueue(label: "camera.session.queue")
+    
     func configure() async {
         // Request permission
         let status = AVCaptureDevice.authorizationStatus(for: .video)
@@ -578,10 +627,11 @@ final class CameraModel: ObservableObject {
         // Apple device types:
         // - .builtInWideAngleCamera → the standard "Wide" camera (≈ 26mm equiv)
         // - .builtInUltraWideCamera → the Ultra Wide (≈ 13mm) — we intentionally avoid this
-        let discovery = AVCaptureDevice.DiscoverySession( deviceTypes: [.builtInWideAngleCamera], mediaType: .video, position: .back )
+        let discovery = AVCaptureDevice.DiscoverySession( deviceTypes: [.builtInUltraWideCamera], mediaType: .video, position: .back )
         guard let device = discovery.devices.first else {
             throw CameraError.noRearWideCamera
         }
+
         let input = try AVCaptureDeviceInput(device: device)
         guard session.canAddInput(input) else {
             throw CameraError.cannotAddInput
@@ -607,6 +657,7 @@ final class CameraModel: ObservableObject {
         }
         return session
     }
+    
     /// Find the format with the largest pixel dimensions; within that, capture the highest supported max FPS.
     private static func bestFormatAndFrameRate(for device: AVCaptureDevice) -> (format: AVCaptureDevice.Format, maxFPS: Double?) {
         // Sort formats by area (width * height), then by highest supported max frame rate.
