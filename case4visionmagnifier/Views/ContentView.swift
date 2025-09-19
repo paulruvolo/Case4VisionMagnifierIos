@@ -8,7 +8,7 @@
 import SwiftUI
 
 struct ContentView: View {
-    @State var showLandscape: Bool = false
+    @State var showLandscape: Bool = true
     var body: some View {
         VStack {
             Button("Magnifier") {

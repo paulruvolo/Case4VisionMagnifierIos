@@ -11,15 +11,29 @@ import Combine
 import simd
 import CoreMotion
 import CoreImage
+import opencv2
+
+enum FilterMode: String, CaseIterable, Identifiable {
+    case none = "None"
+    case blackOnWhite = "Black on white"
+    case whiteOnBlack = "White on black"
+    case yellowOnBlack = "Yellow on black"
+    var id: Self { self }
+}
+
+
 // MARK: - SwiftUI Camera View
 struct RearWideCameraView: View {
     @StateObject private var model = CameraModel()
+    @State private var filterMode: FilterMode = .none
     @State private var isFrozen = false
     @State private var includeGuides = false
+    @State private var showPicker = false
+    
     var body: some View {
         ZStack {
             if let session = model.session {
-                CameraPreview(session: session, isFrozen: $isFrozen)
+                CameraPreview(session: session, isFrozen: $isFrozen, filterMode: $filterMode)
                     .ignoresSafeArea()
                     .onAppear { model.start() }
                     .onDisappear { model.stop() }
@@ -27,11 +41,28 @@ struct RearWideCameraView: View {
                     HStack {
                         Button(isFrozen ? "Unfreeze" : "Freeze") {
                             isFrozen.toggle()
-                        }.buttonStyle(.borderedProminent)
+                        }
+                        .fontWeight(.bold)
+                        .padding()
+                        .background(
+                            RoundedRectangle(cornerRadius: 12)
+                                .stroke(Color.blue, lineWidth: 5)
+                                .fill(Color.white)
+                        )
+
                         Spacer()
-                        Button("Color Filter") {
-                            print("Top Right tapped")
-                        }.buttonStyle(.borderedProminent)
+                        Picker("Filter mode", selection: $filterMode) {
+                            ForEach(FilterMode.allCases) { mode in
+                                Text(mode.rawValue)
+                                    .tag(mode)
+                            }
+                        }
+                        .pickerStyle(.menu)
+                        .background(
+                            RoundedRectangle(cornerRadius: 12)
+                                .stroke(Color.blue, lineWidth: 5)
+                                .fill(Color.white)
+                        )
                     }
                     Spacer()
                     HStack {
@@ -51,7 +82,7 @@ struct RearWideCameraView: View {
                                     device.unlockForConfiguration()
                                 } catch {
                                     device.unlockForConfiguration()
-                                    print("torch error")
+                                    print("torch error \(error)")
                                 }
                             } else if device.torchMode == .on {
                                 do {
@@ -60,14 +91,28 @@ struct RearWideCameraView: View {
                                     device.unlockForConfiguration()
                                 } catch {
                                     device.unlockForConfiguration()
-                                    print("torch error")
+                                    print("torch error \(error)")
                                 }
                             }
-                        }.buttonStyle(.borderedProminent)
+                        }
+                        .fontWeight(.bold)
+                        .padding()
+                        .background(
+                            RoundedRectangle(cornerRadius: 12)
+                                .stroke(Color.blue, lineWidth: 5)
+                                .fill(Color.white)
+                        )
                         Spacer()
                         Button("Toggle Guide Lines") {
                             includeGuides.toggle()
-                        }.buttonStyle(.borderedProminent)
+                        }
+                        .fontWeight(.bold)
+                        .padding()
+                        .background(
+                            RoundedRectangle(cornerRadius: 12)
+                                .stroke(Color.blue, lineWidth: 5)
+                                .fill(Color.white)
+                        )
                     }
                 }
                 .padding() // space from edges
@@ -188,6 +233,8 @@ final class PreviewView: UIView {
 struct CameraPreview: UIViewRepresentable {
     let session: AVCaptureSession
     @Binding var isFrozen: Bool
+    @Binding var filterMode: FilterMode
+
     var minZoom: CGFloat = 1.0
     var maxZoom: CGFloat = 6.0
     
@@ -240,6 +287,7 @@ struct CameraPreview: UIViewRepresentable {
     }
     
     func updateUIView(_ scroll: UIScrollView, context: Context) { context.coordinator.applyFreeze(isFrozen)
+        context.coordinator.setFilterMode(filterMode)
         context.coordinator.centerContent()
     }
     
@@ -251,6 +299,7 @@ struct CameraPreview: UIViewRepresentable {
         weak var container: UIView?
         weak var preview: PreviewView?
         weak var overlay: UIImageView?
+        private var filterMode: FilterMode = .none
         private let ciContext = CIContext()
         private let sampleQueue = DispatchQueue(label: "freeze.preview.sample")
         private var latestImage: UIImage?
@@ -383,8 +432,8 @@ struct CameraPreview: UIViewRepresentable {
         /// - Parameters:
         ///   - uiImage: the UIImage (e.g., from the camera feed or a freeze frame)
         /// - Returns: the corrected CGImage if the transformation can be applied successfully (nil otherwise)
-        func rectifyToLevel(_ uiImage: UIImage) -> CGImage? {
-            guard let cg = uiImage.cgImage, let gravity = gravity else {
+        func rectifyToLevel(_ cg: CGImage) -> CGImage? {
+            guard let gravity = gravity else {
                 return nil
             }
             let ci = CIImage(cgImage: cg)
@@ -449,7 +498,7 @@ struct CameraPreview: UIViewRepresentable {
                 return
             }
             processingFrame = true
-            DispatchQueue.global(qos: .userInteractive).async {
+            DispatchQueue.global(qos: .userInteractive).async { [self] in
                 guard let pb = CMSampleBufferGetImageBuffer(sampleBuffer) else {
                     self.processingFrame = false
                     return
@@ -466,13 +515,72 @@ struct CameraPreview: UIViewRepresentable {
                 // landscapeRight
                 let image = UIImage(cgImage: cg, scale: 1, orientation: oriented)
                 self.latestImage = image
-                // Ensure .up orientation
-                let upright = UIImage(cgImage: image.cgImage!, scale: image.scale, orientation: .up)
-                if let leveled = self.rectifyToLevel(upright)  {
-                    self.preview?.display(cgImage:leveled)
+                if let filteredImage = self.applyFiltering(image.cgImage!)  {
+                    if let leveled = self.rectifyToLevel(filteredImage) {
+                        self.preview?.display(cgImage:leveled)
+                    } else {
+                        self.preview?.display(cgImage:filteredImage)
+                    }
                 }
+
                 self.processingFrame = false
             }
+        }
+        
+        func setFilterMode(_ filterMode: FilterMode) {
+            self.filterMode = filterMode
+        }
+        
+        private func colorizeBinary(binary: Mat, fgRGB: Scalar , bgRGB: Scalar )->Mat  {
+            let out  = Mat(size: binary.size(), type: CvType.CV_8UC3);
+            out.setTo(scalar: bgRGB)
+            out.setTo(scalar: fgRGB, mask: binary)
+            return out
+        }
+        
+        func applyFiltering(_ input: CGImage)->CGImage? {
+            guard filterMode != .none else {
+                return input
+            }
+            // Show source image
+            let src = Mat(cgImage: input)
+
+            // Transform source image to gray if it is not already
+            let gray: Mat
+            let thresholded: Mat
+
+            if (src.channels() >= 3) {
+                gray = Mat()
+                Imgproc.cvtColor(src: src, dst: gray, code: .COLOR_BGR2GRAY)
+                
+                thresholded = Mat()
+
+                Imgproc.adaptiveThreshold(src: gray, dst: thresholded, maxValue: 255, adaptiveMethod: .ADAPTIVE_THRESH_MEAN_C, thresholdType: .THRESH_BINARY, blockSize: 161, C: 30)
+
+            } else {
+                thresholded = src
+            }
+            let fgRGB: Scalar
+            let bgRGB: Scalar
+
+            switch filterMode {
+            case .blackOnWhite:
+                fgRGB = Scalar(255.0, 255.0, 255.0)
+                bgRGB = Scalar(0.0, 0.0, 0.0)
+            case .whiteOnBlack:
+                fgRGB = Scalar(0.0, 0.0, 0.0)
+                bgRGB = Scalar(255.0, 255.0, 255.0)
+            case .yellowOnBlack:
+                fgRGB = Scalar(0.0, 0.0, 0.0)
+                bgRGB = Scalar(255.0, 255.0, 0.0)
+            case .none:
+                // Note: this is impossible to get to
+                fgRGB = Scalar(255.0, 255.0, 255.0)
+                bgRGB = Scalar(0.0, 0.0, 0.0)
+            }
+            
+            let coloredMat = colorizeBinary(binary: thresholded, fgRGB: fgRGB, bgRGB: bgRGB)
+            return coloredMat.toCGImage()
         }
         
         // Toggle frozen state
@@ -487,11 +595,7 @@ struct CameraPreview: UIViewRepresentable {
                 } else {
                     imageToRotate = fallbackSnapshot(of: preview)!
                 }
-                // Ensure .up orientation
-                let upright = UIImage(cgImage: imageToRotate.cgImage!,
-                                      scale: imageToRotate.scale,
-                                      orientation: .up)
-                if let leveled = rectifyToLevel(upright) {
+                if let filteredImage = self.applyFiltering(imageToRotate.cgImage!), let leveled = rectifyToLevel(filteredImage) {
                     let leveledUIImage = UIImage(cgImage: leveled)
                     overlay.image = leveledUIImage
                     overlay.isHidden = false
