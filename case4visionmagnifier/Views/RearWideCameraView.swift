@@ -380,6 +380,7 @@ struct CameraPreview: UIViewRepresentable {
             let targetRect = r
             let bl = map(CGPoint(x: r.minX, y: r.minY))
             let br = map(CGPoint(x: r.maxX, y: r.minY))
+            let center = map(CGPoint(x: r.maxX/2.0, y: r.minY/2.0))
             let tl = map(CGPoint(x: r.minX, y: r.maxY))
             let tr = map(CGPoint(x: r.maxX, y: r.maxY))
 
@@ -389,19 +390,24 @@ struct CameraPreview: UIViewRepresentable {
             let minX = xs.min()!, maxX = xs.max()!
             let minY = ys.min()!, maxY = ys.max()!
             let bbox = CGRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
+            let (sx, sy, padX, padY): (CGFloat, CGFloat, CGFloat, CGFloat)
 
-            // 2) Build a normalization that places the quad inside targetRect
-            let tx = -bbox.minX
-            let ty = -bbox.minY
             let sxFill = targetRect.width  / bbox.width
             let syFill = targetRect.height / bbox.height
-
-            let (sx, sy, padX, padY): (CGFloat, CGFloat, CGFloat, CGFloat)
+            
             // Uniform scale (preserve aspect). Center with padding.
             let s = min(sxFill, syFill)
             sx = s; sy = s
-            padX = (targetRect.width  - bbox.width  * s) * 0.5
-            padY = (targetRect.height - bbox.height * s) * 0.5
+
+            
+            // 2) Build a normalization that places the quad inside targetRect
+            let tx = -center.x + 1.0 / s * targetRect.width / 2.0 // -bbox.minX
+            let ty = -center.y + 1.0 / s * targetRect.height / 2.0 // -bbox.minY
+
+            // this preserves the placement of the center at the center point of the new bounding box
+            // TODO: could  change the scaling if needed
+            padX = 0 // (targetRect.width  - bbox.width  * s) * 0.5
+            padY = 0 // (targetRect.height - bbox.height * s) * 0.5
             // Apply: translate to origin -> scale -> translate into targetRect
             func norm(_ p: CGPoint) -> CGPoint {
                 let x = (p.x + tx) * sx + targetRect.minX + padX
@@ -751,6 +757,32 @@ final class CameraModel: ObservableObject {
             device.activeVideoMinFrameDuration = duration
             device.activeVideoMaxFrameDuration = duration
         }
+        
+        // 1) Use continuous AF (keeps adjusting on its own)
+        if device.isFocusModeSupported(.continuousAutoFocus) {
+            device.focusMode = .continuousAutoFocus
+        }
+
+        // 2) Aim AF at the optical center of the active sensor
+        // (Normalized coordinates: (0,0)=top-left, (1,1)=bottom-right in
+        // landscape-right sensor space. Center is always 0.5,0.5.)
+        if device.isFocusPointOfInterestSupported {
+            print("biasing towards center")
+            device.focusPointOfInterest = CGPoint(x: 0.5, y: 0.5)
+        }
+
+        // 3) Bias AF range toward close subjects
+        if device.isAutoFocusRangeRestrictionSupported {
+            print("biasing near focus")
+            device.autoFocusRangeRestriction = .near
+        }
+
+        // 4) No need for smooth AF
+        if device.isSmoothAutoFocusSupported {
+            print("disabling smooth auto focus")
+            device.isSmoothAutoFocusEnabled = false
+        }
+        
         device.unlockForConfiguration()
         // Add a dummy output so the session can run even if you later want to add data/video outputs.
         // For preview-only, this isn’t required, but harmless.
