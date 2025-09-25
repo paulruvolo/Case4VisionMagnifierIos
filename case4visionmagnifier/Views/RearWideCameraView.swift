@@ -29,11 +29,14 @@ struct RearWideCameraView: View {
     @State private var isFrozen = false
     @State private var includeGuides = false
     @State private var showPicker = false
+    @State private var correctPerspective = true
+    @AppStorage("minimumMagnification") private var minimumMagnification: Double = 1.5
+    @Environment(\.scenePhase) private var scenePhase
     
     var body: some View {
         ZStack {
             if let session = model.session {
-                CameraPreview(session: session, isFrozen: $isFrozen, filterMode: $filterMode)
+                CameraPreview(session: session, isFrozen: $isFrozen, filterMode: $filterMode, minimumMagnification: $minimumMagnification, doPerspectiveCorrection: $correctPerspective)
                     .ignoresSafeArea()
                     .onAppear { model.start() }
                     .onDisappear { model.stop() }
@@ -49,7 +52,17 @@ struct RearWideCameraView: View {
                                 .stroke(Color.blue, lineWidth: 5)
                                 .fill(Color.white)
                         )
-
+                        Spacer()
+                        Button(action: { correctPerspective.toggle() }){
+                            Text("Toggle Perspective Correction")
+                        }
+                        .fontWeight(.bold)
+                        .padding()
+                        .background(
+                            RoundedRectangle(cornerRadius: 12)
+                                .stroke(Color.blue, lineWidth: 5)
+                                .fill(Color.white)
+                        )
                         Spacer()
                         Picker("Filter mode", selection: $filterMode) {
                             ForEach(FilterMode.allCases) { mode in
@@ -103,6 +116,17 @@ struct RearWideCameraView: View {
                                 .fill(Color.white)
                         )
                         Spacer()
+                        Button(action: { self.settingsOpener()} ){
+                            Text("Open Settings")
+                        }
+                        .fontWeight(.bold)
+                        .padding()
+                        .background(
+                            RoundedRectangle(cornerRadius: 12)
+                                .stroke(Color.blue, lineWidth: 5)
+                                .fill(Color.white)
+                        )
+                        Spacer()
                         Button("Toggle Guide Lines") {
                             includeGuides.toggle()
                         }
@@ -146,6 +170,18 @@ struct RearWideCameraView: View {
             AppDelegate.orientationLock = .landscapeRight
         }.onDisappear {
             AppDelegate.orientationLock = .all // restore
+        }
+        .onChange(of: scenePhase) { (oldPhase, newPhase) in
+            // When returning from Settings app, values are synced.
+            // No manual synchronize needed; this ensures re-render happens.
+            if newPhase == .active { _ = minimumMagnification } // touch to trigger view update if needed
+        }
+    }
+    private func settingsOpener(){
+        if let url = URL(string: UIApplication.openSettingsURLString) {
+            if UIApplication.shared.canOpenURL(url) {
+                UIApplication.shared.open(url, options: [:], completionHandler: nil)
+            }
         }
     }
 }
@@ -225,9 +261,11 @@ struct CameraPreview: UIViewRepresentable {
     let session: AVCaptureSession
     @Binding var isFrozen: Bool
     @Binding var filterMode: FilterMode
+    @Binding var minimumMagnification: Double
+    @Binding var doPerspectiveCorrection: Bool
 
     var minZoom: CGFloat = 1.0
-    var maxZoom: CGFloat = 6.0
+    var maxZoom: CGFloat = 10.0
     
     func makeCoordinator() -> Coordinator {
         Coordinator(session: session)
@@ -277,7 +315,10 @@ struct CameraPreview: UIViewRepresentable {
         return scroll
     }
     
-    func updateUIView(_ scroll: UIScrollView, context: Context) { context.coordinator.applyFreeze(isFrozen)
+    func updateUIView(_ scroll: UIScrollView, context: Context) {
+        context.coordinator.applyDoPerspectiveCorrection(doPerspectiveCorrection)
+        context.coordinator.applyMinimumMagnification(minimumMagnification)
+        context.coordinator.applyFreeze(isFrozen)
         context.coordinator.setFilterMode(filterMode)
         context.coordinator.centerContent()
     }
@@ -300,7 +341,7 @@ struct CameraPreview: UIViewRepresentable {
         private var K: simd_float3x3?
         private var processingFrame = false
         private let ciCtx = CIContext(options: nil)
-        
+        private var doPerspectiveCorrection = true
         
         /// Start motion updates so we can access the gravity vector
         func startMotion() {
@@ -316,6 +357,14 @@ struct CameraPreview: UIViewRepresentable {
             }
         }
         
+        func applyDoPerspectiveCorrection(_ perspectiveCorrection: Bool) {
+            print("perspectiveCorrection \(perspectiveCorrection)")
+            doPerspectiveCorrection = perspectiveCorrection
+        }
+        
+        func applyMinimumMagnification(_ minimumMag: Double) {
+            scrollView?.minimumZoomScale = minimumMag
+        }
         
         /// Pulls the camera intrinsics from the pixel buffer.  The intrinsics are needed to compute the
         /// homography that corrects for the pitch and roll of the phone.
@@ -430,6 +479,10 @@ struct CameraPreview: UIViewRepresentable {
         ///   - uiImage: the UIImage (e.g., from the camera feed or a freeze frame)
         /// - Returns: the corrected CGImage if the transformation can be applied successfully (nil otherwise)
         func rectifyToLevel(_ cg: CGImage) -> CGImage? {
+            guard doPerspectiveCorrection else {
+                // short circuiting and just returning input
+                return cg
+            }
             guard let gravity = gravity else {
                 return nil
             }
@@ -767,6 +820,12 @@ final class CameraModel: ObservableObject {
             print("biasing near focus")
             device.autoFocusRangeRestriction = .near
         }
+        
+        device.focusPointOfInterest = CGPoint(x: 0.5, y: 0.5)
+
+        // set exposure point in the upper right to avoid darkening parts of the image too much
+        device.exposurePointOfInterest = CGPoint(x: 1.0, y: 0.0)
+        device.exposureMode = .continuousAutoExposure
 
         // 4) No need for smooth AF
         if device.isSmoothAutoFocusSupported {

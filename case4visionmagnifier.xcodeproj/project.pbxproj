@@ -8,6 +8,7 @@
 
 /* Begin PBXBuildFile section */
 		82A06F492E7DB38600FD27FA /* OpenCV in Frameworks */ = {isa = PBXBuildFile; productRef = 82A06F482E7DB38600FD27FA /* OpenCV */; };
+		82D36F172E85AF7900EA77AF /* Settings.bundle in Resources */ = {isa = PBXBuildFile; fileRef = 82D36F162E85AF7900EA77AF /* Settings.bundle */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -31,6 +32,7 @@
 		826FB5102E4CE6D50009BB77 /* case4visionmagnifier.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = case4visionmagnifier.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		826FB51D2E4CE6D60009BB77 /* case4visionmagnifierTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = case4visionmagnifierTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		826FB5272E4CE6D60009BB77 /* case4visionmagnifierUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = case4visionmagnifierUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		82D36F162E85AF7900EA77AF /* Settings.bundle */ = {isa = PBXFileReference; lastKnownFileType = "wrapper.plug-in"; path = Settings.bundle; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -80,6 +82,7 @@
 		826FB5072E4CE6D50009BB77 = {
 			isa = PBXGroup;
 			children = (
+				82D36F162E85AF7900EA77AF /* Settings.bundle */,
 				826FB5122E4CE6D50009BB77 /* case4visionmagnifier */,
 				826FB5202E4CE6D60009BB77 /* case4visionmagnifierTests */,
 				826FB52A2E4CE6D60009BB77 /* case4visionmagnifierUITests */,
@@ -221,6 +224,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				82D36F172E85AF7900EA77AF /* Settings.bundle in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
