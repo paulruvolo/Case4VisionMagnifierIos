@@ -27,7 +27,7 @@ struct case4visionmagnifierApp: App {
 
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            RearWideCameraView()
         }
     }
 }

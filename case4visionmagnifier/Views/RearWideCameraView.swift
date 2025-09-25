@@ -143,21 +143,12 @@ struct RearWideCameraView: View {
         .alert(item: $model.alert) { alert in
             Alert(title: Text(alert.title), message: Text(alert.message), dismissButton: .default(Text("OK")))
         }.onAppear {
-            AppDelegate.orientationLock = .landscape
-            // Nudge rotation if already in portrait:
-            UIDevice.current.setValue(UIInterfaceOrientation.landscapeRight.rawValue, forKey: "orientation")
-            UINavigationController.attemptRotationToDeviceOrientation()
+            AppDelegate.orientationLock = .landscapeRight
         }.onDisappear {
             AppDelegate.orientationLock = .all // restore
         }
     }
 }
-
-//final class PreviewView: UIView {
-//    override class var layerClass: AnyClass { AVCaptureVideoPreviewLayer.self }
-//    var videoPreviewLayer: AVCaptureVideoPreviewLayer { layer as! AVCaptureVideoPreviewLayer
-//    }
-//}
 
 final class PreviewView: UIView {
 
