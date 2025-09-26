@@ -382,7 +382,51 @@ struct CameraPreview: UIViewRepresentable {
             print("perspectiveCorrection \(perspectiveCorrection)")
             doPerspectiveCorrection = perspectiveCorrection
         }
+        typealias vImagePoint = (Float, Float)
+
+        private func scale(_ p: vImagePoint, around: vImagePoint, byFactor factor: Float)->vImagePoint {
+            return ((p.0 - around.0)*factor + around.0, (p.1 - around.1)*factor + around.1)
+        }
         
+        private func calcArea(vertices: [vImagePoint])->Float {
+            guard vertices.count == 4 else {
+                return 0.0
+            }
+            var area: Float = 0.0
+            let verticesAugmented = vertices + [vertices[0]]
+            for i in 0..<verticesAugmented.count - 1 {
+                let vi = verticesAugmented[i]
+                let viplus1 = verticesAugmented[i+1]
+                area += 0.5*(vi.0 - viplus1.0)*(vi.1 + viplus1.1)
+            }
+            return area
+        }
+
+        func makeBlackImage(matching source: CGImage) -> CGImage? {
+            let width = source.width
+            let height = source.height
+            let bitsPerComponent = 8
+            let bytesPerRow = width * 4
+            let colorSpace = CGColorSpaceCreateDeviceRGB()
+            
+            guard let context = CGContext(
+                data: nil,
+                width: width,
+                height: height,
+                bitsPerComponent: bitsPerComponent,
+                bytesPerRow: bytesPerRow,
+                space: colorSpace,
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            ) else {
+                return nil
+            }
+            
+            // Fill with black
+            context.setFillColor(CGColor(red: 0, green: 0, blue: 0, alpha: 1))
+            context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+            
+            return context.makeImage()
+        }
         
         func applyHomographyAccelerate(to ciImage: CIImage, H: simd_float3x3) -> CIImage? {
             let start = Date()
@@ -391,7 +435,6 @@ struct CameraPreview: UIViewRepresentable {
                 return nil
             }
             do {
-                typealias vImagePoint = (Float, Float)
                 
                 var format = vImage_CGImageFormat(
                     bitsPerComponent: 8,
@@ -400,8 +443,7 @@ struct CameraPreview: UIViewRepresentable {
                     bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipFirst.rawValue))!
                 // TODO: we need to be smarter about how we calculate this scale factor (depends a bit on the size of the bounding box on the screen)
                 // TODO: compute the bounding box of the scrollView projected onto the image
-                let s = 2
-                let backgroundImage = cgImage.resize(size: CGSize(width: cgImage.width/s, height: cgImage.height/s))!
+                let backgroundImage = makeBlackImage(matching: cgImage)!
                 let backgroundBuffer = try vImage.PixelBuffer<vImage.Interleaved8x4>(
                     cgImage: backgroundImage,
                     cgImageFormat: &format)
@@ -416,16 +458,27 @@ struct CameraPreview: UIViewRepresentable {
                         // scale
                         let v = SIMD3(Float(p.x) * Float(cgImage.width), Float(p.y) * Float(cgImage.height), 1)
                         let w = H.inverse * v
-                        return (w.x / w.z / Float(s) - subtracting.0, Float(backgroundImage.height) - w.y / w.z / Float(s) - subtracting.1)
+                        return (w.x / w.z - subtracting.0, Float(backgroundImage.height) - w.y / w.z - subtracting.1)
                     }
                     let dstCenter = map(CGPoint(x: 0.5, y: 0.5), subtracting: (0.0, 0.0))
                     let centerOffset = (dstCenter.0 - Float(backgroundImage.width)/2.0,
                                         dstCenter.1 - Float(backgroundImage.height)/2.0)
-                    let dstTopLeft = map(CGPoint(x: 0.0,y: 0.0), subtracting: centerOffset)
-                    let dstTopRight = map(CGPoint(x: 1.0,y: 0.0), subtracting: centerOffset)
-                    let dstBottomLeft = map(CGPoint(x: 0.0,y: 1.0), subtracting: centerOffset)
-                    let dstBottomRight = map(CGPoint(x: 1.0,y: 1.0), subtracting: centerOffset)
-                    print(dstTopLeft, dstTopLeft, dstBottomLeft, dstBottomRight)
+                    var dstTopLeft = map(CGPoint(x: 0.0,y: 0.0), subtracting: centerOffset)
+                    var dstTopRight = map(CGPoint(x: 1.0,y: 0.0), subtracting: centerOffset)
+                    var dstBottomLeft = map(CGPoint(x: 0.0,y: 1.0), subtracting: centerOffset)
+                    var dstBottomRight = map(CGPoint(x: 1.0,y: 1.0), subtracting: centerOffset)
+                    let centerFinal = map(CGPoint(x: 0.5, y: 0.5), subtracting: centerOffset)
+                    let a = calcArea(vertices: [dstTopLeft, dstBottomLeft, dstBottomRight, dstTopRight])
+                    let sourceArea = Float(cgImage.width * cgImage.height)
+                    let scaleFactor = sqrt(sourceArea / a)
+                    // use scaleFactor to scale about the center point
+                    dstTopLeft = scale(dstTopLeft, around: centerFinal, byFactor: scaleFactor)
+                    dstTopRight = scale(dstTopRight, around: centerFinal, byFactor: scaleFactor)
+                    dstBottomLeft = scale(dstBottomLeft, around: centerFinal, byFactor: scaleFactor)
+                    dstBottomRight = scale(dstBottomRight, around: centerFinal, byFactor: scaleFactor)
+
+                    print("area", a)
+                    print(dstTopLeft, dstBottomLeft, dstBottomRight, dstTopRight)
                     
                     return [dstTopLeft, dstTopRight, dstBottomLeft, dstBottomRight]
                 }()
@@ -438,7 +491,7 @@ struct CameraPreview: UIViewRepresentable {
                     let srcTopRight: (Float, Float) = (foregroundWidth, foregroundHeight)
                     let srcBottomLeft: (Float, Float) = (0, 0)
                     let srcBottomRight: (Float, Float) = (foregroundWidth, 0)
-                    print(srcTopLeft, srcTopRight, srcBottomLeft, srcBottomRight)
+                    print(srcTopLeft, srcBottomLeft, srcBottomRight, srcTopRight)
                     return [srcTopLeft, srcTopRight, srcBottomLeft, srcBottomRight]
                 }()
                 
