@@ -8,10 +8,31 @@ import SwiftUI
 import AVFoundation
 import UIKit
 import Combine
+import CoreGraphics
+import Accelerate
 import simd
 import CoreMotion
 import CoreImage
 import opencv2
+
+extension CGImage {
+    func resize(size:CGSize) -> CGImage? {
+        let width: Int = Int(size.width)
+        let height: Int = Int(size.height)
+
+        let bytesPerPixel = self.bitsPerPixel / self.bitsPerComponent
+        let destBytesPerRow = width * bytesPerPixel
+
+
+        guard let colorSpace = self.colorSpace else { return nil }
+        guard let context = CGContext(data: nil, width: width, height: height, bitsPerComponent: self.bitsPerComponent, bytesPerRow: destBytesPerRow, space: colorSpace, bitmapInfo: self.alphaInfo.rawValue) else { return nil }
+
+        context.interpolationQuality = .high
+        context.draw(self, in: CGRect(x: 0, y: 0, width: width, height: height))
+
+        return context.makeImage()
+    }
+}
 
 enum FilterMode: String, CaseIterable, Identifiable {
     case none = "None"
@@ -362,6 +383,90 @@ struct CameraPreview: UIViewRepresentable {
             doPerspectiveCorrection = perspectiveCorrection
         }
         
+        
+        func applyHomographyAccelerate(to ciImage: CIImage, H: simd_float3x3) -> CIImage? {
+            let start = Date()
+            let context = CIContext(options: nil)
+            guard let cgImage = context.createCGImage(ciImage, from: ciImage.extent) else {
+                return nil
+            }
+            do {
+                typealias vImagePoint = (Float, Float)
+                
+                var format = vImage_CGImageFormat(
+                    bitsPerComponent: 8,
+                    bitsPerPixel: 8 * 4,
+                    colorSpace: CGColorSpaceCreateDeviceRGB(),
+                    bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipFirst.rawValue))!
+                let backgroundImage = cgImage.copy()! // cgImage.resize(size: CGSize(width: cgImage.width/2, height: cgImage.height/2))!
+                let backgroundBuffer = try vImage.PixelBuffer<vImage.Interleaved8x4>(
+                    cgImage: backgroundImage,
+                    cgImageFormat: &format)
+                let foregroundBuffer = try vImage.PixelBuffer<vImage.Interleaved8x4>(
+                    cgImage: cgImage,
+                    cgImageFormat: &format)
+                let warpedBuffer = vImage.PixelBuffer<vImage.Interleaved8x4>(
+                    size: backgroundBuffer.size)
+                let s: Float = 1.0
+                let dstPoints: [vImagePoint] = {
+                    func map(_ p: CGPoint, subtracting: vImagePoint) -> vImagePoint {
+                        // scale
+                        let v = SIMD3(Float(p.x) * Float(backgroundImage.width), Float(p.y) * Float(backgroundImage.height), 1)
+                        let w = H.inverse * v
+                        return (w.x / w.z / s - subtracting.0, Float(backgroundImage.height) - w.y / w.z / s - subtracting.1)
+                    }
+                    let dstCenter = map(CGPoint(x: 0.5, y: 0.5), subtracting: (0.0, 0.0))
+                    let centerOffset = (dstCenter.0 - Float(backgroundImage.width)/2.0,
+                                        dstCenter.1 - Float(backgroundImage.height)/2.0)
+                    let dstTopLeft = map(CGPoint(x: 0.0,y: 0.0), subtracting: centerOffset)
+                    let dstTopRight = map(CGPoint(x: 1.0,y: 0.0), subtracting: centerOffset)
+                    let dstBottomLeft = map(CGPoint(x: 0.0,y: 1.0), subtracting: centerOffset)
+                    let dstBottomRight = map(CGPoint(x: 1.0,y: 1.0), subtracting: centerOffset)
+                    print(dstTopLeft, dstTopLeft, dstBottomLeft, dstBottomRight)
+                    
+                    return [dstTopLeft, dstTopRight, dstBottomLeft, dstBottomRight]
+                }()
+                
+                let srcPoints: [vImagePoint] = {
+                    let foregroundWidth = Float(cgImage.width)
+                    let foregroundHeight = Float(cgImage.height)
+                    
+                    let srcTopLeft: (Float, Float) = (0, foregroundHeight)
+                    let srcTopRight: (Float, Float) = (foregroundWidth, foregroundHeight)
+                    let srcBottomLeft: (Float, Float) = (0, 0)
+                    let srcBottomRight: (Float, Float) = (foregroundWidth, 0)
+                    print(srcTopLeft, srcTopRight, srcBottomLeft, srcBottomRight)
+                    return [srcTopLeft, srcTopRight, srcBottomLeft, srcBottomRight]
+                }()
+                
+                var transform = vImage_PerpsectiveTransform()
+                vImageGetPerspectiveWarp(srcPoints, dstPoints, &transform, 0)
+                foregroundBuffer.withUnsafePointerToVImageBuffer { src in
+                    warpedBuffer.withUnsafePointerToVImageBuffer { dst in
+                        
+                        var bgColor: [UInt8] = [0, 0, 0, 0]
+                        
+                        vImagePerspectiveWarp_ARGB8888(
+                            src, dst, nil,
+                            &transform,
+                            vImage_WarpInterpolation(kvImageInterpolationLinear),
+                            &bgColor,
+                            vImage_Flags(kvImageBackgroundColorFill))
+                    }
+                }
+                backgroundBuffer.alphaComposite(.nonpremultiplied,
+                                                topLayer: warpedBuffer,
+                                                destination: backgroundBuffer)
+                
+                
+                let result = backgroundBuffer.makeCGImage(cgImageFormat: format)
+                print(Date().timeIntervalSince(start))
+                return CIImage(cgImage: result!)
+            } catch {
+                return nil
+            }
+        }
+        
         func applyMinimumMagnification(_ minimumMag: Double) {
             scrollView?.minimumZoomScale = minimumMag
         }
@@ -410,6 +515,7 @@ struct CameraPreview: UIViewRepresentable {
         }
         
         func applyHomographyToImage(ci: CIImage, H: simd_float3x3)->CIImage? {
+            return applyHomographyAccelerate(to: ci, H: H)
             // Map via H (Core Image coords: origin at bottom-left)
             func map(_ p: CGPoint) -> CGPoint {
                 let v = SIMD3(Float(p.x), Float(p.y), 1)
@@ -417,10 +523,11 @@ struct CameraPreview: UIViewRepresentable {
                 return CGPoint(x: CGFloat(w.x / w.z), y: CGFloat(w.y / w.z))
             }
             let r = ci.extent
+            // might want to oversample
             let targetRect = r
             let bl = map(CGPoint(x: r.minX, y: r.minY))
             let br = map(CGPoint(x: r.maxX, y: r.minY))
-            let center = map(CGPoint(x: r.maxX/2.0, y: r.minY/2.0))
+            let center = map(CGPoint(x: (r.maxX + r.minY)/2.0, y: (r.maxY + r.minY)/2.0))
             let tl = map(CGPoint(x: r.minX, y: r.maxY))
             let tr = map(CGPoint(x: r.maxX, y: r.maxY))
 
@@ -432,26 +539,24 @@ struct CameraPreview: UIViewRepresentable {
             let bbox = CGRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
             let (sx, sy, padX, padY): (CGFloat, CGFloat, CGFloat, CGFloat)
 
+            // make smaller for testing
             let sxFill = targetRect.width  / bbox.width
             let syFill = targetRect.height / bbox.height
             
             // Uniform scale (preserve aspect). Center with padding.
             let s = min(sxFill, syFill)
+            print("s \(s)")
             sx = s; sy = s
 
             
-            // 2) Build a normalization that places the quad inside targetRect
-            let tx = -center.x + 1.0 / s * targetRect.width / 2.0 // -bbox.minX
-            let ty = -center.y + 1.0 / s * targetRect.height / 2.0 // -bbox.minY
-
             // this preserves the placement of the center at the center point of the new bounding box
-            // TODO: could  change the scaling if needed
-            padX = 0 // (targetRect.width  - bbox.width  * s) * 0.5
-            padY = 0 // (targetRect.height - bbox.height * s) * 0.5
+            let tx = -center.x + 1.0 / s * targetRect.width / 2.0
+            let ty = -center.y + 1.0 / s * targetRect.height / 2.0
+            print(r.minX, r.minY)
             // Apply: translate to origin -> scale -> translate into targetRect
             func norm(_ p: CGPoint) -> CGPoint {
-                let x = (p.x + tx) * sx + targetRect.minX + padX
-                let y = (p.y + ty) * sy + targetRect.minY + padY
+                let x = (p.x + tx) * sx + targetRect.minX
+                let y = (p.y + ty) * sy + targetRect.minY
                 return CGPoint(x: x, y: y)
             }
 
@@ -459,18 +564,26 @@ struct CameraPreview: UIViewRepresentable {
             let TR = norm(tr)
             let BR = norm(br)
             let BL = norm(bl)
+            print(norm(center))
+            
 
             // 3) Use CIPerspectiveTransformWithExtent so the OUTPUT extent is fixed
-            guard let f = CIFilter(name: "CIPerspectiveTransformWithExtent") else {
+            guard let f = CIFilter(name: "CIPerspectiveTransform") else {
                 return nil
             }
             f.setValue(ci, forKey: kCIInputImageKey)
-            f.setValue(CIVector(cgRect: targetRect), forKey: "inputExtent")
             f.setValue(CIVector(cgPoint: TL), forKey: "inputTopLeft")
             f.setValue(CIVector(cgPoint: TR), forKey: "inputTopRight")
             f.setValue(CIVector(cgPoint: BR), forKey: "inputBottomRight")
             f.setValue(CIVector(cgPoint: BL), forKey: "inputBottomLeft")
-            return f.outputImage
+            // Crop to original dimensions
+            let quadBoundingBox = CGRect(
+                x: r.minX,
+                y: r.minY,
+                width: r.width,
+                height: r.height
+            )
+            return f.outputImage?.cropped(to: quadBoundingBox)
         }
         
         /// Adjust the UIImage based on the gravity vector as returned by the CoreMotion.
@@ -491,7 +604,8 @@ struct CameraPreview: UIViewRepresentable {
                 // If intrinsics missing, just return input
                 return nil
             }
-            let gravityVectorInCameraConventions = simd_float3(Float(gravity.y), Float(-gravity.x), Float(-gravity.z))
+            // TODO: maybe we can negate each of these entries and negate the from: axis
+            let gravityVectorInCameraConventions = simd_float3(Float(-gravity.y), Float(-gravity.x), Float(-gravity.z))
             let R = simd_float3x3(simd_quatf(from: simd_float3(0, 0, 1), to: gravityVectorInCameraConventions))
             let H = K * R * simd_inverse(K)
             // correct for perspective
