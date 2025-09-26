@@ -398,7 +398,10 @@ struct CameraPreview: UIViewRepresentable {
                     bitsPerPixel: 8 * 4,
                     colorSpace: CGColorSpaceCreateDeviceRGB(),
                     bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipFirst.rawValue))!
-                let backgroundImage = cgImage.copy()! // cgImage.resize(size: CGSize(width: cgImage.width/2, height: cgImage.height/2))!
+                // TODO: we need to be smarter about how we calculate this scale factor (depends a bit on the size of the bounding box on the screen)
+                // TODO: compute the bounding box of the scrollView projected onto the image
+                let s = 2
+                let backgroundImage = cgImage.resize(size: CGSize(width: cgImage.width/s, height: cgImage.height/s))!
                 let backgroundBuffer = try vImage.PixelBuffer<vImage.Interleaved8x4>(
                     cgImage: backgroundImage,
                     cgImageFormat: &format)
@@ -407,13 +410,13 @@ struct CameraPreview: UIViewRepresentable {
                     cgImageFormat: &format)
                 let warpedBuffer = vImage.PixelBuffer<vImage.Interleaved8x4>(
                     size: backgroundBuffer.size)
-                let s: Float = 1.0
+
                 let dstPoints: [vImagePoint] = {
                     func map(_ p: CGPoint, subtracting: vImagePoint) -> vImagePoint {
                         // scale
-                        let v = SIMD3(Float(p.x) * Float(backgroundImage.width), Float(p.y) * Float(backgroundImage.height), 1)
+                        let v = SIMD3(Float(p.x) * Float(cgImage.width), Float(p.y) * Float(cgImage.height), 1)
                         let w = H.inverse * v
-                        return (w.x / w.z / s - subtracting.0, Float(backgroundImage.height) - w.y / w.z / s - subtracting.1)
+                        return (w.x / w.z / Float(s) - subtracting.0, Float(backgroundImage.height) - w.y / w.z / Float(s) - subtracting.1)
                     }
                     let dstCenter = map(CGPoint(x: 0.5, y: 0.5), subtracting: (0.0, 0.0))
                     let centerOffset = (dstCenter.0 - Float(backgroundImage.width)/2.0,
