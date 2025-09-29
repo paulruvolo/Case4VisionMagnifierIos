@@ -14,6 +14,275 @@ import simd
 import CoreMotion
 import CoreImage
 import opencv2
+import Metal
+import MetalKit
+
+
+// 3x3 helpers
+func T(_ tx: Float, _ ty: Float) -> simd_float3x3 {
+    simd_float3x3(columns: (
+        SIMD3(1, 0, 0),
+        SIMD3(0, 1, 0),
+        SIMD3(tx, ty, 1)
+    ))
+}
+func S(_ s: Float) -> simd_float3x3 {
+    simd_float3x3(columns: (
+        SIMD3(s, 0, 0),
+        SIMD3(0, s, 0),
+        SIMD3(0, 0, 1)
+    ))
+}
+func N_pix2norm(_ W: Float, _ H: Float) -> simd_float3x3 {
+    // (x_px, y_px, 1) -> (x/W, y/H, 1)
+    simd_float3x3(columns: (
+        SIMD3(1.0 / W, 0, 0),
+        SIMD3(0, 1.0 / H, 0),
+        SIMD3(0, 0, 1)
+    ))
+}
+func N_norm2pix(_ W: Float, _ H: Float) -> simd_float3x3 {
+    simd_float3x3(columns: (
+        SIMD3(W, 0, 0),
+        SIMD3(0, H, 0),
+        SIMD3(0, 0, 1)
+    ))
+}
+
+// Project pixel point through a 3x3 homography
+func project(_ H: simd_float3x3, _ x: Float, _ y: Float) -> SIMD2<Float> {
+    let v = SIMD3<Float>(x, y, 1)
+    let w = H * v
+    return SIMD2(w.x / w.z, w.y / w.z)
+}
+
+// Shoelace area (positive, in pixel^2), vertices must be ordered around the quad
+func quadArea(_ p: [SIMD2<Float>]) -> Float {
+    precondition(p.count == 4)
+    let v = p + [p[0]]
+    var a: Float = 0
+    for i in 0..<4 {
+        a += 0.5 * (v[i].x - v[i+1].x) * (v[i].y + v[i+1].y)
+    }
+    return abs(a)
+}
+
+struct WarpUniforms {
+    var M: simd_float3x3      // destNorm -> srcNorm
+    var oobAlpha: Float
+}
+
+func buildDestToSourceMatrix(
+    H_srcToDst: simd_float3x3,
+    width W: Int, height Hgt: Int
+) -> simd_float3x3 {
+    let Wf = Float(W), Hf = Float(Hgt)
+    let center = SIMD2(Wf * 0.5, Hf * 0.5)
+
+    // 1) Raw projected quad (dest pixel coords) by mapping src corners through H
+    //    BUT to invert in shader, we need dest->src, so compute corners by Hinv
+    let Hinv = H_srcToDst.inverse
+
+    let tl = project(Hinv, 0,    0)
+    let tr = project(Hinv, Wf,   0)
+    let bl = project(Hinv, 0,   Hf)
+    let br = project(Hinv, Wf,  Hf)
+
+    // 2) Centering: translate so that the projected center lands at the dest center
+    //    Project the source center through Hinv, then compute offset to screen center.
+    let srcCenterInDst = project(Hinv, Wf * 0.5, Hf * 0.5)
+    let offset = center - srcCenterInDst      // amount to add in dest pixel space
+
+    // 3) Area matching scale about center.
+    let rawArea = quadArea([tl, bl, br, tr])  // area of projected quad (pixel^2)
+    let srcArea = Wf * Hf
+    // Scale so areas match: s = sqrt(srcArea / rawArea)
+    let s = sqrt(max(1e-8, srcArea / max(1e-8, rawArea)))
+
+    // 4) Build A: dest-space transform applied BEFORE Hinv (i.e., to dest pixels)
+    //    A = Translate(+center) * Scale(s) * Translate(-center) * Translate(offset)
+    //    Order matters; we want to first nudge by offset, then scale about center.
+    let A = T(offset.x, offset.y) * T(center.x, center.y) * S(s) * T(-center.x, -center.y)
+
+    // 5) We want M_norm = Nsrc * Hinv * A * Ndst^-1
+    //    (destNorm -> destPix) -> A -> (still destPix) -> Hinv -> srcPix -> (srcNorm)
+    let Nsrc = N_pix2norm(Wf, Hf)
+    let NdstInv = N_norm2pix(Wf, Hf)
+    let M_norm = Nsrc * Hinv * A * NdstInv
+    return M_norm
+}
+
+final class WarpRenderer {
+    // MARK: - Metal / CI
+    let device: MTLDevice
+    let queue: MTLCommandQueue
+    let ciContext: CIContext
+    let pipeline: MTLRenderPipelineState
+    let sampler: MTLSamplerState
+    // Off-screen textures (reused & resized as needed)
+    private var srcScratchTex: MTLTexture? // holds the input CIImage
+    private var dstScratchTex: MTLTexture? // render target for warped output
+    // (If you have a CVPixelBuffer, also keep a CVMetalTextureCache)
+
+    struct WarpUniforms { var M: simd_float3x3; var oobAlpha: Float }
+
+    init?() {
+        guard let dev = MTLCreateSystemDefaultDevice(),
+              let q = dev.makeCommandQueue() else { return nil }
+        device = dev
+        queue = q
+        ciContext = CIContext(mtlDevice: dev, options: [ .useSoftwareRenderer: false ])
+
+        // Pipeline (matches the shader names we discussed earlier)
+        let lib = try! dev.makeDefaultLibrary()!
+        let vfn = lib.makeFunction(name: "vs_fullscreen_triangle")!
+        let ffn = lib.makeFunction(name: "fs_warp")!
+        let p = MTLRenderPipelineDescriptor()
+        p.vertexFunction = vfn
+        p.fragmentFunction = ffn
+        p.colorAttachments[0].pixelFormat = .bgra8Unorm
+        pipeline = try! dev.makeRenderPipelineState(descriptor: p)
+
+        let sd = MTLSamplerDescriptor()
+        sd.minFilter = .linear
+        sd.magFilter = .linear
+        sd.sAddressMode = .clampToEdge
+        sd.tAddressMode = .clampToEdge
+        sampler = dev.makeSamplerState(descriptor: sd)!
+
+        //super.init()
+    }
+
+    // MARK: - The matrix builder (from the previous message)
+    private func T(_ tx: Float, _ ty: Float) -> simd_float3x3 {
+        simd_float3x3(columns: (SIMD3(1,0,0), SIMD3(0,1,0), SIMD3(tx,ty,1)))
+    }
+    private func S(_ s: Float) -> simd_float3x3 {
+        simd_float3x3(columns: (SIMD3(s,0,0), SIMD3(0,s,0), SIMD3(0,0,1)))
+    }
+    private func N_pix2norm(_ W: Float, _ H: Float) -> simd_float3x3 {
+        simd_float3x3(columns: (SIMD3(1/W,0,0), SIMD3(0,1/H,0), SIMD3(0,0,1)))
+    }
+    private func N_norm2pix(_ W: Float, _ H: Float) -> simd_float3x3 {
+        simd_float3x3(columns: (SIMD3(W,0,0), SIMD3(0,H,0), SIMD3(0,0,1)))
+    }
+    private func project(_ H: simd_float3x3, _ x: Float, _ y: Float) -> SIMD2<Float> {
+        let v = SIMD3<Float>(x,y,1); let w = H * v; return SIMD2(w.x/w.z, w.y/w.z)
+    }
+    private func quadArea(_ p: [SIMD2<Float>]) -> Float {
+        precondition(p.count == 4)
+        let v = p + [p[0]]
+        var a: Float = 0
+        for i in 0..<4 { a += 0.5 * (v[i].x - v[i+1].x) * (v[i].y + v[i+1].y) }
+        return abs(a)
+    }
+
+    private func buildDestToSourceMatrix(H_srcToDst: simd_float3x3,
+                                         width W: Int, height Hgt: Int) -> simd_float3x3 {
+        let Wf = Float(W), Hf = Float(Hgt)
+        let center = SIMD2(Wf*0.5, Hf*0.5)
+        let Hinv = H_srcToDst.inverse
+
+        // Raw projected quad (dest pixel coords)
+        let tl = project(Hinv, 0,    0)
+        let tr = project(Hinv, Wf,   0)
+        let bl = project(Hinv, 0,   Hf)
+        let br = project(Hinv, Wf,  Hf)
+
+        // Center alignment
+        let srcCenterInDst = project(Hinv, Wf*0.5, Hf*0.5)
+        let offset = center - srcCenterInDst
+
+        // Area matching
+        let rawArea = quadArea([tl, bl, br, tr])
+        let srcArea = Wf * Hf
+        let s = 1.0/(sqrt(max(1e-8, srcArea / max(1e-8, rawArea))))
+
+        // Pre-warp dest transform A (pixels)
+        let A = T(offset.x, offset.y) * T(center.x, center.y) * S(s) * T(-center.x, -center.y)
+
+        // Norm-space matrix M = Nsrc * Hinv * A * (Ndst^-1)
+        let Nsrc = N_pix2norm(Wf, Hf)
+        let NdstInv = N_norm2pix(Wf, Hf)
+        return Nsrc * Hinv * A * NdstInv
+    }
+
+    // MARK: - Public: call me each frame
+    func processFrame(ciImage: CIImage, H: simd_float3x3)->CIImage? {
+        let dstW = Int(ciImage.extent.width)*CameraPreview.Coordinator.destinationTextureScaleFactor
+        let dstH = Int(ciImage.extent.height)*CameraPreview.Coordinator.destinationTextureScaleFactor
+        print(dstW, dstH)
+
+        // 1) Make a source texture from the CIImage (GPU path, no CPU readback)
+        let srcTex: MTLTexture = {
+            // Reuse a texture of the right size
+            if srcScratchTex == nil ||
+               srcScratchTex!.width  != Int(ciImage.extent.width) ||
+               srcScratchTex!.height != Int(ciImage.extent.height) {
+                let td = MTLTextureDescriptor.texture2DDescriptor(
+                    pixelFormat: .bgra8Unorm,
+                    width: Int(ciImage.extent.width),
+                    height: Int(ciImage.extent.height),
+                    mipmapped: false)
+                td.usage = [.shaderRead, .shaderWrite, .renderTarget]
+                srcScratchTex = device.makeTexture(descriptor: td)
+            }
+            return srcScratchTex!
+        }()
+
+        // Destination texture (warp render target)
+        if dstScratchTex == nil ||
+          dstScratchTex!.width != dstW || dstScratchTex!.height != dstH {
+          let td = MTLTextureDescriptor.texture2DDescriptor(
+              pixelFormat: .bgra8Unorm,
+              width: dstW, height: dstH, mipmapped: false)
+          td.usage = [.renderTarget, .shaderRead]  // we’ll read it as a CIImage
+          td.storageMode = .private
+          dstScratchTex = device.makeTexture(descriptor: td)
+        }
+        let dstTex = dstScratchTex!
+        
+        let cmd = queue.makeCommandBuffer()!
+
+        // Render the CIImage into srcTex (still on GPU)
+        ciContext.render(ciImage,
+                         to: srcTex,
+                         commandBuffer: cmd,
+                         bounds: ciImage.extent,
+                         colorSpace: CGColorSpaceCreateDeviceRGB())
+        // 2) Warp pass into dstTex
+        let rp = MTLRenderPassDescriptor()
+        rp.colorAttachments[0].texture = dstTex
+        rp.colorAttachments[0].loadAction  = .clear
+        rp.colorAttachments[0].storeAction = .store
+        rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0)
+
+        let enc = cmd.makeRenderCommandEncoder(descriptor: rp)!
+        enc.setRenderPipelineState(pipeline)
+        enc.setFragmentTexture(srcTex, index: 0)
+        enc.setFragmentSamplerState(sampler, index: 0)
+
+        var U = WarpUniforms(
+            M: buildDestToSourceMatrix(H_srcToDst: H, width: dstW, height: dstH),
+            oobAlpha: 0.0
+        )
+        enc.setFragmentBytes(&U, length: MemoryLayout<WarpUniforms>.stride, index: 0)
+        enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+        enc.endEncoding()
+
+        cmd.commit()
+        cmd.waitUntilCompleted() // ensure the texture is ready to read
+
+        // --- Wrap as CIImage (GPU-backed) ---
+        // (If the result appears vertically flipped in your CI workflow, apply .oriented(.downMirrored).)
+        let outCI = CIImage(
+            mtlTexture: dstTex,
+            options: [.colorSpace: CGColorSpaceCreateDeviceRGB()]
+        )!.oriented(.downMirrored) // adjust/remove if you see a flip
+
+        return outCI
+    }
+}
 
 extension CGImage {
     func resize(size:CGSize) -> CGImage? {
@@ -50,57 +319,86 @@ struct RearWideCameraView: View {
     @State private var isFrozen = false
     @State private var includeGuides = false
     @State private var showPicker = false
+    @StateObject private var torch = TorchMonitor()
     @State private var correctPerspective = true
     @AppStorage("minimumMagnification") private var minimumMagnification: Double = 1.5
     @Environment(\.scenePhase) private var scenePhase
+    
+    private static let sfSymbolSize: CGFloat = 60
+    
+    private var buttonBGColor: Color {
+        switch filterMode {
+        case .blackOnWhite:
+            return .black
+        case .whiteOnBlack:
+            return .white
+        case .yellowOnBlack:
+            return .white
+        case .none:
+            return .black
+        }
+    }
     
     var body: some View {
         ZStack {
             if let session = model.session {
                 CameraPreview(session: session, isFrozen: $isFrozen, filterMode: $filterMode, minimumMagnification: $minimumMagnification, doPerspectiveCorrection: $correctPerspective)
                     .ignoresSafeArea()
-                    .onAppear { model.start() }
+                    .onAppear {
+                        model.start()
+                        if let device = model.device {
+                            print("attaching!")
+                            torch.attach(device: device)
+                        }
+                    }
                     .onDisappear { model.stop() }
                 VStack {
                     HStack {
-                        Button(isFrozen ? "Unfreeze" : "Freeze") {
+                        Button(action: {
                             isFrozen.toggle()
-                        }
-                        .fontWeight(.bold)
-                        .padding()
-                        .background(
-                            RoundedRectangle(cornerRadius: 12)
-                                .stroke(Color.blue, lineWidth: 5)
-                                .fill(Color.white)
-                        )
-                        Spacer()
-                        Button(action: { correctPerspective.toggle() }){
-                            Text("Toggle Perspective Correction")
-                        }
-                        .fontWeight(.bold)
-                        .padding()
-                        .background(
-                            RoundedRectangle(cornerRadius: 12)
-                                .stroke(Color.blue, lineWidth: 5)
-                                .fill(Color.white)
-                        )
-                        Spacer()
-                        Picker("Filter mode", selection: $filterMode) {
-                            ForEach(FilterMode.allCases) { mode in
-                                Text(mode.rawValue)
-                                    .tag(mode)
+                        }) {
+                            if isFrozen {
+                                Image(systemName: "snowflake.slash")
+                                    .font(.system(size: Self.sfSymbolSize))
+                                    .foregroundColor(buttonBGColor)
+                            } else {
+                                Image(systemName: "snowflake")
+                                    .font(.system(size: Self.sfSymbolSize))
+                                    .foregroundColor(buttonBGColor)
                             }
                         }
-                        .pickerStyle(.menu)
-                        .background(
-                            RoundedRectangle(cornerRadius: 12)
-                                .stroke(Color.blue, lineWidth: 5)
-                                .fill(Color.white)
-                        )
+//                        Spacer()
+//                        Button(action: { correctPerspective.toggle() }){
+//                            Text("Toggle Perspective Correction")
+//                        }
+//                        .fontWeight(.bold)
+//                        .padding()
+//                        .background(
+//                            RoundedRectangle(cornerRadius: 12)
+//                                .stroke(Color.blue, lineWidth: 5)
+//                                .fill(Color.white)
+//                        )
+                        Spacer()
+                        Button(action: {
+                            switch filterMode {
+                            case .none:
+                                filterMode = .blackOnWhite
+                            case .blackOnWhite:
+                                filterMode = .whiteOnBlack
+                            case .whiteOnBlack:
+                                filterMode = .yellowOnBlack
+                            case .yellowOnBlack:
+                                filterMode = .none
+                            }
+                        }) {
+                            Image(systemName: "camera.filters")
+                                .font(.system(size: Self.sfSymbolSize))
+                                .foregroundColor(buttonBGColor)
+                        }
                     }
                     Spacer()
                     HStack {
-                        Button("Toggle Flash Light") {
+                        Button(action: {
                             guard let videoInput = session.inputs
                                 .compactMap({ $0 as? AVCaptureDeviceInput })
                                 .first(where: { $0.device.hasMediaType(.video) }),
@@ -128,39 +426,39 @@ struct RearWideCameraView: View {
                                     print("torch error \(error)")
                                 }
                             }
+                        }) {
+                            if torch.isOn {
+                                Image(systemName: "flashlight.slash.circle")
+                                    .font(.system(size: Self.sfSymbolSize))
+                                    .foregroundColor(buttonBGColor)
+                            } else {
+                                Image(systemName: "flashlight.on.circle")
+                                    .font(.system(size: Self.sfSymbolSize))
+                                    .foregroundColor(buttonBGColor)
+                            }
                         }
-                        .fontWeight(.bold)
-                        .padding()
-                        .background(
-                            RoundedRectangle(cornerRadius: 12)
-                                .stroke(Color.blue, lineWidth: 5)
-                                .fill(Color.white)
-                        )
+//                        Spacer()
+//                        Button(action: { self.settingsOpener()} ){
+//                            Text("Open Settings")
+//                        }
+//                        .fontWeight(.bold)
+//                        .padding()
+//                        .background(
+//                            RoundedRectangle(cornerRadius: 12)
+//                                .stroke(Color.blue, lineWidth: 5)
+//                                .fill(Color.white)
+//                        )
                         Spacer()
-                        Button(action: { self.settingsOpener()} ){
-                            Text("Open Settings")
-                        }
-                        .fontWeight(.bold)
-                        .padding()
-                        .background(
-                            RoundedRectangle(cornerRadius: 12)
-                                .stroke(Color.blue, lineWidth: 5)
-                                .fill(Color.white)
-                        )
-                        Spacer()
-                        Button("Toggle Guide Lines") {
+                        Button(action: {
                             includeGuides.toggle()
+                        }) {
+                            Image(systemName: "equal.circle")
+                                .font(.system(size: Self.sfSymbolSize))
+                                .foregroundColor(buttonBGColor)
                         }
-                        .fontWeight(.bold)
-                        .padding()
-                        .background(
-                            RoundedRectangle(cornerRadius: 12)
-                                .stroke(Color.blue, lineWidth: 5)
-                                .fill(Color.white)
-                        )
                     }
                 }
-                .padding() // space from edges
+                .padding([.top], 15) // space from edges
                
             } else {
                 VStack(spacing: 12) {
@@ -177,11 +475,11 @@ struct RearWideCameraView: View {
                     Rectangle()
                         .fill(Color.red)
                         .frame(width: geo.size.width, height: 10)
-                        .position(x: geo.size.width/2, y: 100)
+                        .position(x: geo.size.width/2, y: 110)
                     Rectangle()
                         .fill(Color.red)
                         .frame(width: geo.size.width, height: 10)
-                        .position(x: geo.size.width/2, y: geo.size.height-100)
+                        .position(x: geo.size.width/2, y: geo.size.height-110)
                 }.ignoresSafeArea()
             }
         }
@@ -363,6 +661,16 @@ struct CameraPreview: UIViewRepresentable {
         private var processingFrame = false
         private let ciCtx = CIContext(options: nil)
         private var doPerspectiveCorrection = true
+        var renderer: WarpRenderer?
+        
+        // Create once
+        let device = MTLCreateSystemDefaultDevice()!
+        
+        let psDesc = MTLRenderPipelineDescriptor()
+        let library: MTLLibrary
+        let pipeline: MTLRenderPipelineState
+        let sampler: MTLSamplerState
+        static let destinationTextureScaleFactor = 1
         
         /// Start motion updates so we can access the gravity vector
         func startMotion() {
@@ -427,6 +735,30 @@ struct CameraPreview: UIViewRepresentable {
             
             return context.makeImage()
         }
+        
+        // Per frame:
+        func drawWarp(commandBuffer: MTLCommandBuffer,
+                      renderPass: MTLRenderPassDescriptor,
+                      srcTex: MTLTexture,
+                      H_srcToDst: simd_float3x3,
+                      dstW: Int, dstH: Int)
+        {
+            let enc = commandBuffer.makeRenderCommandEncoder(descriptor: renderPass)!
+            enc.setRenderPipelineState(pipeline)
+            enc.setFragmentTexture(srcTex, index: 0)
+            enc.setFragmentSamplerState(sampler, index: 0)
+
+            var U = WarpUniforms(
+                M: buildDestToSourceMatrix(H_srcToDst: H_srcToDst, width: dstW, height: dstH),
+                oobAlpha: 0.0 // transparent outside
+            )
+            enc.setFragmentBytes(&U, length: MemoryLayout<WarpUniforms>.stride, index: 0)
+
+            // Fullscreen triangle: 3 vertices, no buffers
+            enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+            enc.endEncoding()
+        }
+
         
         func applyHomographyAccelerate(to ciImage: CIImage, H: simd_float3x3) -> CIImage? {
             let start = Date()
@@ -571,6 +903,15 @@ struct CameraPreview: UIViewRepresentable {
         }
         
         func applyHomographyToImage(ci: CIImage, H: simd_float3x3)->CIImage? {
+            if renderer == nil {
+                renderer = WarpRenderer()
+            }
+            guard let renderer = renderer, let overlay = overlay else {
+                return nil
+            }
+            return renderer.processFrame(ciImage: ci,
+                                  H: H.inverse)
+            return nil
             return applyHomographyAccelerate(to: ci, H: H)
             // Map via H (Core Image coords: origin at bottom-left)
             func map(_ p: CGPoint) -> CGPoint {
@@ -661,11 +1002,18 @@ struct CameraPreview: UIViewRepresentable {
                 return nil
             }
             // TODO: maybe we can negate each of these entries and negate the from: axis
-            let gravityVectorInCameraConventions = simd_float3(Float(-gravity.y), Float(-gravity.x), Float(-gravity.z))
+            let gravityVectorInCameraConventions = simd_float3(Float(gravity.y), Float(-gravity.x), Float(-gravity.z))
             let R = simd_float3x3(simd_quatf(from: simd_float3(0, 0, 1), to: gravityVectorInCameraConventions))
-            let H = K * R * simd_inverse(K)
+            var K_scaled = K
+            let s = Float(Self.destinationTextureScaleFactor)
+            K_scaled.columns.0.x *= s
+            K_scaled.columns.1.y *= s
+            K_scaled.columns.2.x *= s
+            K_scaled.columns.2.y *= s
+            print("K_scaled", K_scaled)
+            let H = K * R * simd_inverse(K_scaled)
             // correct for perspective
-            guard let out = applyHomographyToImage(ci: ci, H: H) else {
+            guard let out = applyHomographyToImage(ci: ci, H: H.inverse) else {
                 return nil
             }
             // the output as a CGImage
@@ -677,6 +1025,12 @@ struct CameraPreview: UIViewRepresentable {
 
         init(session: AVCaptureSession) {
             self.session = session
+            self.library = try! device.makeDefaultLibrary()!
+            psDesc.vertexFunction = library.makeFunction(name: "vs_fullscreen_triangle")
+            psDesc.fragmentFunction = library.makeFunction(name: "fs_warp")
+            psDesc.colorAttachments[0].pixelFormat = .bgra8Unorm
+            self.pipeline = try! device.makeRenderPipelineState(descriptor: psDesc)
+            self.sampler = device.makeSamplerState(descriptor: MTLSamplerDescriptor())! // default = linear, clamp
         }
         
         // Add (or reuse) a VideoDataOutput so we can grab the latest frame as UIImage
@@ -736,7 +1090,9 @@ struct CameraPreview: UIViewRepresentable {
                 let image = UIImage(cgImage: cg, scale: 1, orientation: oriented)
                 self.latestImage = image
                 if let filteredImage = self.applyFiltering(image.cgImage!)  {
+                    let startLevel = Date()
                     if let leveled = self.rectifyToLevel(filteredImage) {
+                        print("time to level \(Date().timeIntervalSince(startLevel))")
                         self.preview?.display(cgImage:leveled)
                     } else {
                         self.preview?.display(cgImage:filteredImage)
@@ -885,6 +1241,7 @@ struct CameraPreview: UIViewRepresentable {
 final class CameraModel: ObservableObject {
     @Published var session: AVCaptureSession?
     @Published var alert: CameraAlert?
+    var device: AVCaptureDevice?
     private let sessionQueue = DispatchQueue(label: "camera.session.queue")
     
     func configure() async {
@@ -907,9 +1264,10 @@ final class CameraModel: ObservableObject {
         await withCheckedContinuation {
             continuation in sessionQueue.async {
                 do {
-                    let session = try Self.makeRearWideHighResSession()
+                    let (session, device) = try Self.makeRearWideHighResSession()
                     DispatchQueue.main.async {
                         self.session = session
+                        self.device = device
                         continuation.resume()
                     }
                 }
@@ -943,7 +1301,7 @@ final class CameraModel: ObservableObject {
     
     // MARK: Session builder (rear WIDE, highest resolution)
     
-    private static func makeRearWideHighResSession() throws -> AVCaptureSession {
+    private static func makeRearWideHighResSession() throws -> (AVCaptureSession, AVCaptureDevice) {
         let session = AVCaptureSession()
         // Use inputPriority so our chosen activeFormat takes precedence over preset.
         session.sessionPreset = .inputPriority
@@ -1011,7 +1369,7 @@ final class CameraModel: ObservableObject {
         if session.canAddOutput(output) {
             session.addOutput(output)
         }
-        return session
+        return (session, device)
     }
     
     /// Find the format with the largest pixel dimensions; within that, capture the highest supported max FPS.

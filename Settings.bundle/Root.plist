@@ -15,6 +15,7 @@
 				<string>1.5x</string>
 				<string>2x</string>
 				<string>3x</string>
+				<string>5x</string>
 			</array>
 			<key>Values</key>
 			<array>
@@ -22,13 +23,14 @@
 				<real>1.5</real>
 				<integer>2</integer>
 				<integer>3</integer>
+				<integer>5</integer>
 			</array>
 			<key>Title</key>
 			<string>Minimum Magnification</string>
 			<key>Key</key>
 			<string>minimumMagnification</string>
 			<key>DefaultValue</key>
-			<real>1.5</real>
+			<integer>3</integer>
 		</dict>
 	</array>
 </dict>

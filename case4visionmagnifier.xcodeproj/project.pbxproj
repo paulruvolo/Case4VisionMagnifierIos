@@ -29,7 +29,7 @@
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
-		826FB5102E4CE6D50009BB77 /* case4visionmagnifier.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = case4visionmagnifier.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		826FB5102E4CE6D50009BB77 /* CLOSEUP.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = CLOSEUP.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		826FB51D2E4CE6D60009BB77 /* case4visionmagnifierTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = case4visionmagnifierTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		826FB5272E4CE6D60009BB77 /* case4visionmagnifierUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = case4visionmagnifierUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		82D36F162E85AF7900EA77AF /* Settings.bundle */ = {isa = PBXFileReference; lastKnownFileType = "wrapper.plug-in"; path = Settings.bundle; sourceTree = "<group>"; };
@@ -93,7 +93,7 @@
 		826FB5112E4CE6D50009BB77 /* Products */ = {
 			isa = PBXGroup;
 			children = (
-				826FB5102E4CE6D50009BB77 /* case4visionmagnifier.app */,
+				826FB5102E4CE6D50009BB77 /* CLOSEUP.app */,
 				826FB51D2E4CE6D60009BB77 /* case4visionmagnifierTests.xctest */,
 				826FB5272E4CE6D60009BB77 /* case4visionmagnifierUITests.xctest */,
 			);
@@ -123,7 +123,7 @@
 				82A06F482E7DB38600FD27FA /* OpenCV */,
 			);
 			productName = case4visionmagnifier;
-			productReference = 826FB5102E4CE6D50009BB77 /* case4visionmagnifier.app */;
+			productReference = 826FB5102E4CE6D50009BB77 /* CLOSEUP.app */;
 			productType = "com.apple.product-type.application";
 		};
 		826FB51C2E4CE6D60009BB77 /* case4visionmagnifierTests */ = {
@@ -425,7 +425,7 @@
 				);
 				MARKETING_VERSION = 1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = edu.occamlab.case4visionmagnifier;
-				PRODUCT_NAME = "$(TARGET_NAME)";
+				PRODUCT_NAME = CLOSEUP;
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2";
@@ -454,7 +454,7 @@
 				);
 				MARKETING_VERSION = 1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = edu.occamlab.case4visionmagnifier;
-				PRODUCT_NAME = "$(TARGET_NAME)";
+				PRODUCT_NAME = CLOSEUP;
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2";
