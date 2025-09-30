@@ -326,7 +326,7 @@ struct RearWideCameraView: View {
     
     private static let sfSymbolSize: CGFloat = 60
     
-    private var buttonBGColor: Color {
+    private var buttonFGColor: Color {
         switch filterMode {
         case .blackOnWhite:
             return .black
@@ -336,6 +336,19 @@ struct RearWideCameraView: View {
             return .white
         case .none:
             return .black
+        }
+    }
+    
+    private var buttonBGColor: Color {
+        switch filterMode {
+        case .blackOnWhite:
+            return .white
+        case .whiteOnBlack:
+            return .black
+        case .yellowOnBlack:
+            return .black
+        case .none:
+            return .white
         }
     }
     
@@ -360,13 +373,17 @@ struct RearWideCameraView: View {
                             if isFrozen {
                                 Image(systemName: "snowflake.slash")
                                     .font(.system(size: Self.sfSymbolSize))
-                                    .foregroundColor(buttonBGColor)
+                                    .foregroundColor(buttonFGColor)
                             } else {
                                 Image(systemName: "snowflake")
                                     .font(.system(size: Self.sfSymbolSize))
-                                    .foregroundColor(buttonBGColor)
+                                    .foregroundColor(buttonFGColor)
                             }
                         }
+                        .padding(5)
+                        .background(
+                            Circle().fill(buttonBGColor) // solid circular background
+                        )
 //                        Spacer()
 //                        Button(action: { correctPerspective.toggle() }){
 //                            Text("Toggle Perspective Correction")
@@ -393,8 +410,12 @@ struct RearWideCameraView: View {
                         }) {
                             Image(systemName: "camera.filters")
                                 .font(.system(size: Self.sfSymbolSize))
-                                .foregroundColor(buttonBGColor)
+                                .foregroundColor(buttonFGColor)
                         }
+                        .padding(5)
+                        .background(
+                            Circle().fill(buttonBGColor) // solid circular background
+                        )
                     }
                     Spacer()
                     HStack {
@@ -430,13 +451,17 @@ struct RearWideCameraView: View {
                             if torch.isOn {
                                 Image(systemName: "flashlight.slash.circle")
                                     .font(.system(size: Self.sfSymbolSize))
-                                    .foregroundColor(buttonBGColor)
+                                    .foregroundColor(buttonFGColor)
                             } else {
                                 Image(systemName: "flashlight.on.circle")
                                     .font(.system(size: Self.sfSymbolSize))
-                                    .foregroundColor(buttonBGColor)
+                                    .foregroundColor(buttonFGColor)
                             }
                         }
+                        .padding(5)
+                        .background(
+                            Circle().fill(buttonBGColor) // solid circular background
+                        )
 //                        Spacer()
 //                        Button(action: { self.settingsOpener()} ){
 //                            Text("Open Settings")
@@ -454,8 +479,12 @@ struct RearWideCameraView: View {
                         }) {
                             Image(systemName: "equal.circle")
                                 .font(.system(size: Self.sfSymbolSize))
-                                .foregroundColor(buttonBGColor)
+                                .foregroundColor(buttonFGColor)
                         }
+                        .padding(5)
+                        .background(
+                            Circle().fill(buttonBGColor) // solid circular background
+                        )
                     }
                 }
                 .padding([.top], 15) // space from edges
@@ -1348,12 +1377,13 @@ final class CameraModel: ObservableObject {
             print("biasing near focus")
             device.autoFocusRangeRestriction = .near
         }
-        
-        device.focusPointOfInterest = CGPoint(x: 0.5, y: 0.5)
-
-        // set exposure point in the upper right to avoid darkening parts of the image too much
-        device.exposurePointOfInterest = CGPoint(x: 1.0, y: 0.0)
-        device.exposureMode = .continuousAutoExposure
+        if device.isExposurePointOfInterestSupported {
+            // set exposure point in the upper right to avoid darkening parts of the image too much
+            device.exposurePointOfInterest = CGPoint(x: 1.0, y: 0.0)
+        }
+        if device.isExposureModeSupported(.continuousAutoExposure) {
+            device.exposureMode = .continuousAutoExposure
+        }
 
         // 4) No need for smooth AF
         if device.isSmoothAutoFocusSupported {
