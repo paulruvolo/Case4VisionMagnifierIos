@@ -134,7 +134,7 @@ final class WarpRenderer {
         ciContext = CIContext(mtlDevice: dev, options: [ .useSoftwareRenderer: false ])
 
         // Pipeline (matches the shader names we discussed earlier)
-        let lib = try! dev.makeDefaultLibrary()!
+        let lib = dev.makeDefaultLibrary()!
         let vfn = lib.makeFunction(name: "vs_fullscreen_triangle")!
         let ffn = lib.makeFunction(name: "fs_warp")!
         let p = MTLRenderPipelineDescriptor()
@@ -149,26 +149,59 @@ final class WarpRenderer {
         sd.sAddressMode = .clampToEdge
         sd.tAddressMode = .clampToEdge
         sampler = dev.makeSamplerState(descriptor: sd)!
-
-        //super.init()
     }
 
-    // MARK: - The matrix builder (from the previous message)
+    /// Build a translation transform as a 3x3 matrix (operates on homogeneous coordinates)
+    /// - Parameters:
+    ///   - tx: x translation to apply
+    ///   - ty: y translation to apply
+    /// - Returns: a 3x3 matrix that applies the transform
     private func T(_ tx: Float, _ ty: Float) -> simd_float3x3 {
         simd_float3x3(columns: (SIMD3(1,0,0), SIMD3(0,1,0), SIMD3(tx,ty,1)))
     }
+    
+    /// Build a scale transform as a 3x3 matrix (operates on homogeneous coordinates)
+    /// - Parameters:
+    ///   - s: the scale factor to apply
+    /// - Returns: a 3x3 matrix that applies the transform
     private func S(_ s: Float) -> simd_float3x3 {
         simd_float3x3(columns: (SIMD3(s,0,0), SIMD3(0,s,0), SIMD3(0,0,1)))
     }
+    
+    /// Convert from pixels to normalized values (0,1)
+    /// - Parameters:
+    ///   - W: the width of the image
+    ///   - H: the height of the image
+    /// - Returns: a 3x3 transform that converts to normalized values
     private func N_pix2norm(_ W: Float, _ H: Float) -> simd_float3x3 {
         simd_float3x3(columns: (SIMD3(1/W,0,0), SIMD3(0,1/H,0), SIMD3(0,0,1)))
     }
+    
+    /// Convert from normalized values (0,1) to pxels
+    /// - Parameters:
+    ///   - W: the width of the image
+    ///   - H: the height of the image
+    /// - Returns: a 3x3 transform that converts to pixel values
     private func N_norm2pix(_ W: Float, _ H: Float) -> simd_float3x3 {
         simd_float3x3(columns: (SIMD3(W,0,0), SIMD3(0,H,0), SIMD3(0,0,1)))
     }
+    
+    
+    /// Use the given transform (usually a homography) to project the pixel coordinate x, y
+    /// - Parameters:
+    ///   - H: the projective transform (e.g., a homography)
+    ///   - x: the x pixel coordinate
+    ///   - y: the y pixel coordinate
+    /// - Returns: the projected pixel coordinates
     private func project(_ H: simd_float3x3, _ x: Float, _ y: Float) -> SIMD2<Float> {
-        let v = SIMD3<Float>(x,y,1); let w = H * v; return SIMD2(w.x/w.z, w.y/w.z)
+        let v = SIMD3<Float>(x,y,1)
+        let w = H * v
+        return SIMD2(w.x/w.z, w.y/w.z)
     }
+    
+    /// Computes the pixel area of a quadrilateral from its vertices.  A counterclockwise ordering of the vertices is assumed.
+    /// - Parameter p: the pixel coordinates of the vertices
+    /// - Returns: the area in pixels
     private func quadArea(_ p: [SIMD2<Float>]) -> Float {
         precondition(p.count == 4)
         let v = p + [p[0]]
@@ -244,7 +277,7 @@ final class WarpRenderer {
         
         let cmd = queue.makeCommandBuffer()!
 
-        // Render the CIImage into srcTex (still on GPU)
+        // Render the CIImage into srcTex
         ciContext.render(ciImage,
                          to: srcTex,
                          commandBuffer: cmd,
@@ -273,33 +306,13 @@ final class WarpRenderer {
         cmd.commit()
         cmd.waitUntilCompleted() // ensure the texture is ready to read
 
-        // --- Wrap as CIImage (GPU-backed) ---
-        // (If the result appears vertically flipped in your CI workflow, apply .oriented(.downMirrored).)
+        // --- Wrap as CIImage (GPU-backed) --
         let outCI = CIImage(
             mtlTexture: dstTex,
             options: [.colorSpace: CGColorSpaceCreateDeviceRGB()]
         )!.oriented(.downMirrored) // adjust/remove if you see a flip
 
         return outCI
-    }
-}
-
-extension CGImage {
-    func resize(size:CGSize) -> CGImage? {
-        let width: Int = Int(size.width)
-        let height: Int = Int(size.height)
-
-        let bytesPerPixel = self.bitsPerPixel / self.bitsPerComponent
-        let destBytesPerRow = width * bytesPerPixel
-
-
-        guard let colorSpace = self.colorSpace else { return nil }
-        guard let context = CGContext(data: nil, width: width, height: height, bitsPerComponent: self.bitsPerComponent, bytesPerRow: destBytesPerRow, space: colorSpace, bitmapInfo: self.alphaInfo.rawValue) else { return nil }
-
-        context.interpolationQuality = .high
-        context.draw(self, in: CGRect(x: 0, y: 0, width: width, height: height))
-
-        return context.makeImage()
     }
 }
 
@@ -636,9 +649,6 @@ struct CameraPreview: UIViewRepresentable {
         let preview = PreviewView()
         preview.frame = container.bounds
         preview.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-//        preview.videoPreviewLayer.session = session
-//        preview.videoPreviewLayer.videoGravity = .resizeAspectFill
-//        preview.videoPreviewLayer.connection?.videoOrientation = .landscapeRight
         container.addSubview(preview)
         // Frozen overlay (hidden by default)
         let overlay = UIImageView(frame: container.bounds)
@@ -716,7 +726,6 @@ struct CameraPreview: UIViewRepresentable {
         }
         
         func applyDoPerspectiveCorrection(_ perspectiveCorrection: Bool) {
-            print("perspectiveCorrection \(perspectiveCorrection)")
             doPerspectiveCorrection = perspectiveCorrection
         }
         typealias vImagePoint = (Float, Float)
@@ -737,151 +746,6 @@ struct CameraPreview: UIViewRepresentable {
                 area += 0.5*(vi.0 - viplus1.0)*(vi.1 + viplus1.1)
             }
             return area
-        }
-
-        func makeBlackImage(matching source: CGImage) -> CGImage? {
-            let width = source.width
-            let height = source.height
-            let bitsPerComponent = 8
-            let bytesPerRow = width * 4
-            let colorSpace = CGColorSpaceCreateDeviceRGB()
-            
-            guard let context = CGContext(
-                data: nil,
-                width: width,
-                height: height,
-                bitsPerComponent: bitsPerComponent,
-                bytesPerRow: bytesPerRow,
-                space: colorSpace,
-                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-            ) else {
-                return nil
-            }
-            
-            // Fill with black
-            context.setFillColor(CGColor(red: 0, green: 0, blue: 0, alpha: 1))
-            context.fill(CGRect(x: 0, y: 0, width: width, height: height))
-            
-            return context.makeImage()
-        }
-        
-        // Per frame:
-        func drawWarp(commandBuffer: MTLCommandBuffer,
-                      renderPass: MTLRenderPassDescriptor,
-                      srcTex: MTLTexture,
-                      H_srcToDst: simd_float3x3,
-                      dstW: Int, dstH: Int)
-        {
-            let enc = commandBuffer.makeRenderCommandEncoder(descriptor: renderPass)!
-            enc.setRenderPipelineState(pipeline)
-            enc.setFragmentTexture(srcTex, index: 0)
-            enc.setFragmentSamplerState(sampler, index: 0)
-
-            var U = WarpUniforms(
-                M: buildDestToSourceMatrix(H_srcToDst: H_srcToDst, width: dstW, height: dstH),
-                oobAlpha: 0.0 // transparent outside
-            )
-            enc.setFragmentBytes(&U, length: MemoryLayout<WarpUniforms>.stride, index: 0)
-
-            // Fullscreen triangle: 3 vertices, no buffers
-            enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
-            enc.endEncoding()
-        }
-
-        
-        func applyHomographyAccelerate(to ciImage: CIImage, H: simd_float3x3) -> CIImage? {
-            let start = Date()
-            let context = CIContext(options: nil)
-            guard let cgImage = context.createCGImage(ciImage, from: ciImage.extent) else {
-                return nil
-            }
-            do {
-                
-                var format = vImage_CGImageFormat(
-                    bitsPerComponent: 8,
-                    bitsPerPixel: 8 * 4,
-                    colorSpace: CGColorSpaceCreateDeviceRGB(),
-                    bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipFirst.rawValue))!
-                // TODO: we need to be smarter about how we calculate this scale factor (depends a bit on the size of the bounding box on the screen)
-                // TODO: compute the bounding box of the scrollView projected onto the image
-                let backgroundImage = makeBlackImage(matching: cgImage)!
-                let backgroundBuffer = try vImage.PixelBuffer<vImage.Interleaved8x4>(
-                    cgImage: backgroundImage,
-                    cgImageFormat: &format)
-                let foregroundBuffer = try vImage.PixelBuffer<vImage.Interleaved8x4>(
-                    cgImage: cgImage,
-                    cgImageFormat: &format)
-                let warpedBuffer = vImage.PixelBuffer<vImage.Interleaved8x4>(
-                    size: backgroundBuffer.size)
-
-                let dstPoints: [vImagePoint] = {
-                    func map(_ p: CGPoint, subtracting: vImagePoint) -> vImagePoint {
-                        // scale
-                        let v = SIMD3(Float(p.x) * Float(cgImage.width), Float(p.y) * Float(cgImage.height), 1)
-                        let w = H.inverse * v
-                        return (w.x / w.z - subtracting.0, Float(backgroundImage.height) - w.y / w.z - subtracting.1)
-                    }
-                    let dstCenter = map(CGPoint(x: 0.5, y: 0.5), subtracting: (0.0, 0.0))
-                    let centerOffset = (dstCenter.0 - Float(backgroundImage.width)/2.0,
-                                        dstCenter.1 - Float(backgroundImage.height)/2.0)
-                    var dstTopLeft = map(CGPoint(x: 0.0,y: 0.0), subtracting: centerOffset)
-                    var dstTopRight = map(CGPoint(x: 1.0,y: 0.0), subtracting: centerOffset)
-                    var dstBottomLeft = map(CGPoint(x: 0.0,y: 1.0), subtracting: centerOffset)
-                    var dstBottomRight = map(CGPoint(x: 1.0,y: 1.0), subtracting: centerOffset)
-                    let centerFinal = map(CGPoint(x: 0.5, y: 0.5), subtracting: centerOffset)
-                    let a = calcArea(vertices: [dstTopLeft, dstBottomLeft, dstBottomRight, dstTopRight])
-                    let sourceArea = Float(cgImage.width * cgImage.height)
-                    let scaleFactor = sqrt(sourceArea / a)
-                    // use scaleFactor to scale about the center point
-                    dstTopLeft = scale(dstTopLeft, around: centerFinal, byFactor: scaleFactor)
-                    dstTopRight = scale(dstTopRight, around: centerFinal, byFactor: scaleFactor)
-                    dstBottomLeft = scale(dstBottomLeft, around: centerFinal, byFactor: scaleFactor)
-                    dstBottomRight = scale(dstBottomRight, around: centerFinal, byFactor: scaleFactor)
-
-                    print("area", a)
-                    print(dstTopLeft, dstBottomLeft, dstBottomRight, dstTopRight)
-                    
-                    return [dstTopLeft, dstTopRight, dstBottomLeft, dstBottomRight]
-                }()
-                
-                let srcPoints: [vImagePoint] = {
-                    let foregroundWidth = Float(cgImage.width)
-                    let foregroundHeight = Float(cgImage.height)
-                    
-                    let srcTopLeft: (Float, Float) = (0, foregroundHeight)
-                    let srcTopRight: (Float, Float) = (foregroundWidth, foregroundHeight)
-                    let srcBottomLeft: (Float, Float) = (0, 0)
-                    let srcBottomRight: (Float, Float) = (foregroundWidth, 0)
-                    print(srcTopLeft, srcBottomLeft, srcBottomRight, srcTopRight)
-                    return [srcTopLeft, srcTopRight, srcBottomLeft, srcBottomRight]
-                }()
-                
-                var transform = vImage_PerpsectiveTransform()
-                vImageGetPerspectiveWarp(srcPoints, dstPoints, &transform, 0)
-                foregroundBuffer.withUnsafePointerToVImageBuffer { src in
-                    warpedBuffer.withUnsafePointerToVImageBuffer { dst in
-                        
-                        var bgColor: [UInt8] = [0, 0, 0, 0]
-                        
-                        vImagePerspectiveWarp_ARGB8888(
-                            src, dst, nil,
-                            &transform,
-                            vImage_WarpInterpolation(kvImageInterpolationLinear),
-                            &bgColor,
-                            vImage_Flags(kvImageBackgroundColorFill))
-                    }
-                }
-                backgroundBuffer.alphaComposite(.nonpremultiplied,
-                                                topLayer: warpedBuffer,
-                                                destination: backgroundBuffer)
-                
-                
-                let result = backgroundBuffer.makeCGImage(cgImageFormat: format)
-                print(Date().timeIntervalSince(start))
-                return CIImage(cgImage: result!)
-            } catch {
-                return nil
-            }
         }
         
         func applyMinimumMagnification(_ minimumMag: Double) {
@@ -935,81 +799,10 @@ struct CameraPreview: UIViewRepresentable {
             if renderer == nil {
                 renderer = WarpRenderer()
             }
-            guard let renderer = renderer, let overlay = overlay else {
+            guard let renderer = renderer else {
                 return nil
             }
-            return renderer.processFrame(ciImage: ci,
-                                  H: H.inverse)
-            return nil
-            return applyHomographyAccelerate(to: ci, H: H)
-            // Map via H (Core Image coords: origin at bottom-left)
-            func map(_ p: CGPoint) -> CGPoint {
-                let v = SIMD3(Float(p.x), Float(p.y), 1)
-                let w = H * v
-                return CGPoint(x: CGFloat(w.x / w.z), y: CGFloat(w.y / w.z))
-            }
-            let r = ci.extent
-            // might want to oversample
-            let targetRect = r
-            let bl = map(CGPoint(x: r.minX, y: r.minY))
-            let br = map(CGPoint(x: r.maxX, y: r.minY))
-            let center = map(CGPoint(x: (r.maxX + r.minY)/2.0, y: (r.maxY + r.minY)/2.0))
-            let tl = map(CGPoint(x: r.minX, y: r.maxY))
-            let tr = map(CGPoint(x: r.maxX, y: r.maxY))
-
-            // 1) Compute the bounding box of the warped quad
-            let xs = [tl.x, tr.x, br.x, bl.x]
-            let ys = [tl.y, tr.y, br.y, bl.y]
-            let minX = xs.min()!, maxX = xs.max()!
-            let minY = ys.min()!, maxY = ys.max()!
-            let bbox = CGRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
-            let (sx, sy, padX, padY): (CGFloat, CGFloat, CGFloat, CGFloat)
-
-            // make smaller for testing
-            let sxFill = targetRect.width  / bbox.width
-            let syFill = targetRect.height / bbox.height
-            
-            // Uniform scale (preserve aspect). Center with padding.
-            let s = min(sxFill, syFill)
-            print("s \(s)")
-            sx = s; sy = s
-
-            
-            // this preserves the placement of the center at the center point of the new bounding box
-            let tx = -center.x + 1.0 / s * targetRect.width / 2.0
-            let ty = -center.y + 1.0 / s * targetRect.height / 2.0
-            print(r.minX, r.minY)
-            // Apply: translate to origin -> scale -> translate into targetRect
-            func norm(_ p: CGPoint) -> CGPoint {
-                let x = (p.x + tx) * sx + targetRect.minX
-                let y = (p.y + ty) * sy + targetRect.minY
-                return CGPoint(x: x, y: y)
-            }
-
-            let TL = norm(tl)
-            let TR = norm(tr)
-            let BR = norm(br)
-            let BL = norm(bl)
-            print(norm(center))
-            
-
-            // 3) Use CIPerspectiveTransformWithExtent so the OUTPUT extent is fixed
-            guard let f = CIFilter(name: "CIPerspectiveTransform") else {
-                return nil
-            }
-            f.setValue(ci, forKey: kCIInputImageKey)
-            f.setValue(CIVector(cgPoint: TL), forKey: "inputTopLeft")
-            f.setValue(CIVector(cgPoint: TR), forKey: "inputTopRight")
-            f.setValue(CIVector(cgPoint: BR), forKey: "inputBottomRight")
-            f.setValue(CIVector(cgPoint: BL), forKey: "inputBottomLeft")
-            // Crop to original dimensions
-            let quadBoundingBox = CGRect(
-                x: r.minX,
-                y: r.minY,
-                width: r.width,
-                height: r.height
-            )
-            return f.outputImage?.cropped(to: quadBoundingBox)
+            return renderer.processFrame(ciImage: ci, H: H.inverse)
         }
         
         /// Adjust the UIImage based on the gravity vector as returned by the CoreMotion.
@@ -1039,7 +832,6 @@ struct CameraPreview: UIViewRepresentable {
             K_scaled.columns.1.y *= s
             K_scaled.columns.2.x *= s
             K_scaled.columns.2.y *= s
-            print("K_scaled", K_scaled)
             let H = K * R * simd_inverse(K_scaled)
             // correct for perspective
             guard let out = applyHomographyToImage(ci: ci, H: H.inverse) else {
