@@ -601,7 +601,7 @@ struct CameraPreview: UIViewRepresentable {
         var renderer: WarpRenderer?
         var thresholder: AdaptiveThreshColorized?
         private var frameCountDown = 0
-        static let framesToDrop = 0
+        static let framesToDrop = 1
         let device = MTLCreateSystemDefaultDevice()!
         /// this flag communicates to the renderer and warper that we should prepare a UIImage from the result (this is a costly operation that shouldn't be done every frame)
         var prepareToFreeze = false
