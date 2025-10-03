@@ -13,104 +13,8 @@ import Accelerate
 import simd
 import CoreMotion
 import CoreImage
-import opencv2
 import Metal
 import MetalKit
-
-
-// 3x3 helpers
-func T(_ tx: Float, _ ty: Float) -> simd_float3x3 {
-    simd_float3x3(columns: (
-        SIMD3(1, 0, 0),
-        SIMD3(0, 1, 0),
-        SIMD3(tx, ty, 1)
-    ))
-}
-func S(_ s: Float) -> simd_float3x3 {
-    simd_float3x3(columns: (
-        SIMD3(s, 0, 0),
-        SIMD3(0, s, 0),
-        SIMD3(0, 0, 1)
-    ))
-}
-func N_pix2norm(_ W: Float, _ H: Float) -> simd_float3x3 {
-    // (x_px, y_px, 1) -> (x/W, y/H, 1)
-    simd_float3x3(columns: (
-        SIMD3(1.0 / W, 0, 0),
-        SIMD3(0, 1.0 / H, 0),
-        SIMD3(0, 0, 1)
-    ))
-}
-func N_norm2pix(_ W: Float, _ H: Float) -> simd_float3x3 {
-    simd_float3x3(columns: (
-        SIMD3(W, 0, 0),
-        SIMD3(0, H, 0),
-        SIMD3(0, 0, 1)
-    ))
-}
-
-// Project pixel point through a 3x3 homography
-func project(_ H: simd_float3x3, _ x: Float, _ y: Float) -> SIMD2<Float> {
-    let v = SIMD3<Float>(x, y, 1)
-    let w = H * v
-    return SIMD2(w.x / w.z, w.y / w.z)
-}
-
-// Shoelace area (positive, in pixel^2), vertices must be ordered around the quad
-func quadArea(_ p: [SIMD2<Float>]) -> Float {
-    precondition(p.count == 4)
-    let v = p + [p[0]]
-    var a: Float = 0
-    for i in 0..<4 {
-        a += 0.5 * (v[i].x - v[i+1].x) * (v[i].y + v[i+1].y)
-    }
-    return abs(a)
-}
-
-struct WarpUniforms {
-    var M: simd_float3x3      // destNorm -> srcNorm
-    var oobAlpha: Float
-}
-
-func buildDestToSourceMatrix(
-    H_srcToDst: simd_float3x3,
-    width W: Int, height Hgt: Int
-) -> simd_float3x3 {
-    let Wf = Float(W), Hf = Float(Hgt)
-    let center = SIMD2(Wf * 0.5, Hf * 0.5)
-
-    // 1) Raw projected quad (dest pixel coords) by mapping src corners through H
-    //    BUT to invert in shader, we need dest->src, so compute corners by Hinv
-    let Hinv = H_srcToDst.inverse
-
-    let tl = project(Hinv, 0,    0)
-    let tr = project(Hinv, Wf,   0)
-    let bl = project(Hinv, 0,   Hf)
-    let br = project(Hinv, Wf,  Hf)
-
-    // 2) Centering: translate so that the projected center lands at the dest center
-    //    Project the source center through Hinv, then compute offset to screen center.
-    let srcCenterInDst = project(Hinv, Wf * 0.5, Hf * 0.5)
-    let offset = center - srcCenterInDst      // amount to add in dest pixel space
-
-    // 3) Area matching scale about center.
-    let rawArea = quadArea([tl, bl, br, tr])  // area of projected quad (pixel^2)
-    let srcArea = Wf * Hf
-    // Scale so areas match: s = sqrt(srcArea / rawArea)
-    let s = sqrt(max(1e-8, srcArea / max(1e-8, rawArea)))
-
-    // 4) Build A: dest-space transform applied BEFORE Hinv (i.e., to dest pixels)
-    //    A = Translate(+center) * Scale(s) * Translate(-center) * Translate(offset)
-    //    Order matters; we want to first nudge by offset, then scale about center.
-    let A = T(offset.x, offset.y) * T(center.x, center.y) * S(s) * T(-center.x, -center.y)
-
-    // 5) We want M_norm = Nsrc * Hinv * A * Ndst^-1
-    //    (destNorm -> destPix) -> A -> (still destPix) -> Hinv -> srcPix -> (srcNorm)
-    let Nsrc = N_pix2norm(Wf, Hf)
-    let NdstInv = N_norm2pix(Wf, Hf)
-    let M_norm = Nsrc * Hinv * A * NdstInv
-    return M_norm
-}
 
 final class WarpRenderer {
     // MARK: - Metal / CI
@@ -310,7 +214,7 @@ final class WarpRenderer {
         let outCI = CIImage(
             mtlTexture: dstTex,
             options: [.colorSpace: CGColorSpaceCreateDeviceRGB()]
-        )!.oriented(.downMirrored) // adjust/remove if you see a flip
+        )!.oriented(.rightMirrored)
 
         return outCI
     }
@@ -397,17 +301,6 @@ struct RearWideCameraView: View {
                         .background(
                             Circle().fill(buttonBGColor) // solid circular background
                         )
-//                        Spacer()
-//                        Button(action: { correctPerspective.toggle() }){
-//                            Text("Toggle Perspective Correction")
-//                        }
-//                        .fontWeight(.bold)
-//                        .padding()
-//                        .background(
-//                            RoundedRectangle(cornerRadius: 12)
-//                                .stroke(Color.blue, lineWidth: 5)
-//                                .fill(Color.white)
-//                        )
                         Spacer()
                         Button(action: {
                             switch filterMode {
@@ -430,7 +323,21 @@ struct RearWideCameraView: View {
                             Circle().fill(buttonBGColor) // solid circular background
                         )
                     }
+                    if includeGuides {
+                        Rectangle()
+                            .fill(Color.red)
+                            .frame(maxWidth: .infinity)
+                            .frame(height: 10)
+                            .ignoresSafeArea()
+                    }
                     Spacer()
+                    if includeGuides {
+                        Rectangle()
+                            .fill(Color.red)
+                            .frame(maxWidth: .infinity)
+                            .frame(height: 10)
+                            .ignoresSafeArea()
+                    }
                     HStack {
                         Button(action: {
                             guard let videoInput = session.inputs
@@ -511,18 +418,6 @@ struct RearWideCameraView: View {
                 } .task {
                     await model.configure()
                 }
-            }
-            if includeGuides {
-                GeometryReader { geo in
-                    Rectangle()
-                        .fill(Color.red)
-                        .frame(width: geo.size.width, height: 10)
-                        .position(x: geo.size.width/2, y: 110)
-                    Rectangle()
-                        .fill(Color.red)
-                        .frame(width: geo.size.width, height: 10)
-                        .position(x: geo.size.width/2, y: geo.size.height-110)
-                }.ignoresSafeArea()
             }
         }
         .alert(item: $model.alert) { alert in
@@ -676,6 +571,9 @@ struct CameraPreview: UIViewRepresentable {
     func updateUIView(_ scroll: UIScrollView, context: Context) {
         context.coordinator.applyDoPerspectiveCorrection(doPerspectiveCorrection)
         context.coordinator.applyMinimumMagnification(minimumMagnification)
+        if isFrozen {
+            context.coordinator.prepareToFreeze = true
+        }
         context.coordinator.applyFreeze(isFrozen)
         context.coordinator.setFilterMode(filterMode)
         context.coordinator.centerContent()
@@ -692,7 +590,7 @@ struct CameraPreview: UIViewRepresentable {
         private var filterMode: FilterMode = .none
         private let ciContext = CIContext()
         private let sampleQueue = DispatchQueue(label: "freeze.preview.sample")
-        private var latestImage: UIImage?
+        private var latestImage: CGImage?
         private let motion = CMMotionManager()
         private(set) var gravity: CMAcceleration?
         // camera intrinsics (pixels)
@@ -701,9 +599,12 @@ struct CameraPreview: UIViewRepresentable {
         private let ciCtx = CIContext(options: nil)
         private var doPerspectiveCorrection = true
         var renderer: WarpRenderer?
-        
-        // Create once
+        var thresholder: AdaptiveThreshColorized?
+        private var frameCountDown = 0
+        static let framesToDrop = 0
         let device = MTLCreateSystemDefaultDevice()!
+        /// this flag communicates to the renderer and warper that we should prepare a UIImage from the result (this is a costly operation that shouldn't be done every frame)
+        var prepareToFreeze = false
         
         let psDesc = MTLRenderPipelineDescriptor()
         let library: MTLLibrary
@@ -746,6 +647,14 @@ struct CameraPreview: UIViewRepresentable {
                 area += 0.5*(vi.0 - viplus1.0)*(vi.1 + viplus1.1)
             }
             return area
+        }
+        
+        func convertCIImageToCGImage(inputImage: CIImage) -> CGImage? {
+            let context = CIContext(options: nil)
+            if let cgImage = context.createCGImage(inputImage, from: inputImage.extent) {
+                return cgImage
+            }
+            return nil
         }
         
         func applyMinimumMagnification(_ minimumMag: Double) {
@@ -799,10 +708,24 @@ struct CameraPreview: UIViewRepresentable {
             if renderer == nil {
                 renderer = WarpRenderer()
             }
+            if thresholder == nil {
+                thresholder = try? AdaptiveThreshColorized(device: device)
+            }
             guard let renderer = renderer else {
                 return nil
             }
-            return renderer.processFrame(ciImage: ci, H: H.inverse)
+            guard let thresholder = thresholder else {
+                return nil
+            }
+            
+            if filterMode == .none {
+                return renderer.processFrame(ciImage: ci, H: H.inverse)
+            } else {
+                guard let thresholded = thresholder.processFrame(ciImage: ci, filterMode: filterMode) else {
+                    return nil
+                }
+                return renderer.processFrame(ciImage: thresholded, H: H.inverse)
+            }
         }
         
         /// Adjust the UIImage based on the gravity vector as returned by the CoreMotion.
@@ -810,15 +733,14 @@ struct CameraPreview: UIViewRepresentable {
         /// - Parameters:
         ///   - uiImage: the UIImage (e.g., from the camera feed or a freeze frame)
         /// - Returns: the corrected CGImage if the transformation can be applied successfully (nil otherwise)
-        func rectifyToLevel(_ cg: CGImage) -> CGImage? {
+        func rectifyToLevel(_ ci: CIImage) -> CIImage? {
             guard doPerspectiveCorrection else {
                 // short circuiting and just returning input
-                return cg
+                return ci
             }
             guard let gravity = gravity else {
                 return nil
             }
-            let ci = CIImage(cgImage: cg)
             guard let K = self.K else {
                 // If intrinsics missing, just return input
                 return nil
@@ -834,14 +756,7 @@ struct CameraPreview: UIViewRepresentable {
             K_scaled.columns.2.y *= s
             let H = K * R * simd_inverse(K_scaled)
             // correct for perspective
-            guard let out = applyHomographyToImage(ci: ci, H: H.inverse) else {
-                return nil
-            }
-            // the output as a CGImage
-            guard let outCG = ciCtx.createCGImage(out, from: out.extent) else {
-                return nil
-            }
-            return outCG
+            return applyHomographyToImage(ci: ci, H: H.inverse)
         }
 
         init(session: AVCaptureSession) {
@@ -887,11 +802,18 @@ struct CameraPreview: UIViewRepresentable {
         }
         
         // Convert frames to UIImage and keep only the latest
-        func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+        func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer:
+                        CMSampleBuffer, from connection: AVCaptureConnection) {
+            let frameStart = Date()
             // We are careful not to process frames too slowly, so we discard frames if we are still processing a previous frame
             guard !processingFrame else {
                 return
             }
+            frameCountDown -= 1
+            guard frameCountDown <= 0 else {
+                return
+            }
+            frameCountDown = 1 + Self.framesToDrop
             processingFrame = true
             DispatchQueue.global(qos: .userInteractive).async { [self] in
                 guard let pb = CMSampleBufferGetImageBuffer(sampleBuffer) else {
@@ -900,26 +822,18 @@ struct CameraPreview: UIViewRepresentable {
                 }
                 self.updateIntrinsicsIfNeeded(from: pb)
                 let ci = CIImage(cvPixelBuffer: pb)
-                // Create CGImage and orient it to match the preview
-                guard let cg = self.ciContext.createCGImage(ci, from: ci.extent) else {
-                    self.processingFrame = false
-                    return
-                }
-                
-                let oriented: UIImage.Orientation = .right
-                // landscapeRight
-                let image = UIImage(cgImage: cg, scale: 1, orientation: oriented)
-                self.latestImage = image
-                if let filteredImage = self.applyFiltering(image.cgImage!)  {
-                    let startLevel = Date()
-                    if let leveled = self.rectifyToLevel(filteredImage) {
-                        print("time to level \(Date().timeIntervalSince(startLevel))")
-                        self.preview?.display(cgImage:leveled)
-                    } else {
-                        self.preview?.display(cgImage:filteredImage)
+                if let leveled = self.rectifyToLevel(ci) {
+                    if prepareToFreeze {
+                        if let latestImage = convertCIImageToCGImage(inputImage: leveled) {
+                            DispatchQueue.main.async {
+                                overlay?.image = UIImage(cgImage: latestImage, scale: 1.0, orientation: .right)
+                            }
+                        }
+                        prepareToFreeze = false
                     }
+                    self.preview?.display(ciImage: leveled)
                 }
-
+                print("total frame processing time \(Date().timeIntervalSince(frameStart))")
                 self.processingFrame = false
             }
         }
@@ -928,76 +842,14 @@ struct CameraPreview: UIViewRepresentable {
             self.filterMode = filterMode
         }
         
-        private func colorizeBinary(binary: Mat, fgRGB: Scalar , bgRGB: Scalar )->Mat  {
-            let out  = Mat(size: binary.size(), type: CvType.CV_8UC3);
-            out.setTo(scalar: bgRGB)
-            out.setTo(scalar: fgRGB, mask: binary)
-            return out
-        }
-        
-        func applyFiltering(_ input: CGImage)->CGImage? {
-            guard filterMode != .none else {
-                return input
-            }
-            // Show source image
-            let src = Mat(cgImage: input)
-
-            // Transform source image to gray if it is not already
-            let gray: Mat
-            let thresholded: Mat
-
-            if (src.channels() >= 3) {
-                gray = Mat()
-                Imgproc.cvtColor(src: src, dst: gray, code: .COLOR_BGR2GRAY)
-                
-                thresholded = Mat()
-
-                Imgproc.adaptiveThreshold(src: gray, dst: thresholded, maxValue: 255, adaptiveMethod: .ADAPTIVE_THRESH_MEAN_C, thresholdType: .THRESH_BINARY, blockSize: 161, C: 30)
-
-            } else {
-                thresholded = src
-            }
-            let fgRGB: Scalar
-            let bgRGB: Scalar
-
-            switch filterMode {
-            case .blackOnWhite:
-                fgRGB = Scalar(255.0, 255.0, 255.0)
-                bgRGB = Scalar(0.0, 0.0, 0.0)
-            case .whiteOnBlack:
-                fgRGB = Scalar(0.0, 0.0, 0.0)
-                bgRGB = Scalar(255.0, 255.0, 255.0)
-            case .yellowOnBlack:
-                fgRGB = Scalar(0.0, 0.0, 0.0)
-                bgRGB = Scalar(255.0, 255.0, 0.0)
-            case .none:
-                // Note: this is impossible to get to
-                fgRGB = Scalar(255.0, 255.0, 255.0)
-                bgRGB = Scalar(0.0, 0.0, 0.0)
-            }
-            
-            let coloredMat = colorizeBinary(binary: thresholded, fgRGB: fgRGB, bgRGB: bgRGB)
-            return coloredMat.toCGImage()
-        }
-        
         // Toggle frozen state
         func applyFreeze(_ frozen: Bool) {
             guard let overlay, let preview else {
                 return
             }
             if frozen {
-                let imageToRotate: UIImage
-                if let img = latestImage {
-                    imageToRotate = img
-                } else {
-                    imageToRotate = fallbackSnapshot(of: preview)!
-                }
-                if let filteredImage = self.applyFiltering(imageToRotate.cgImage!), let leveled = rectifyToLevel(filteredImage) {
-                    let leveledUIImage = UIImage(cgImage: leveled)
-                    overlay.image = leveledUIImage
-                    overlay.isHidden = false
-                    preview.isHidden = true
-                }
+                overlay.isHidden = false
+                preview.isHidden = true
             } else {
                 overlay.isHidden = true
                 preview.isHidden = false
@@ -1017,13 +869,7 @@ struct CameraPreview: UIViewRepresentable {
                 self.lockContentOffsetToCenter()
             }
         }
-        // Fallback snapshot if no video frame was captured yet
-        private func fallbackSnapshot(of view: UIView) -> UIImage? { // Note: AV layers sometimes render black via snapshot; this is just a fallback.
-            let renderer = UIGraphicsImageRenderer(bounds: view.bounds)
-            return renderer.image { ctx in
-                view.drawHierarchy(in: view.bounds, afterScreenUpdates: false)
-            }
-        }
+
         // MARK: UIScrollViewDelegate
         func viewForZooming(in scrollView: UIScrollView) -> UIView? {
             container
