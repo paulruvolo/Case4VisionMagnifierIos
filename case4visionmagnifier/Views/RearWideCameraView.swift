@@ -238,7 +238,7 @@ struct RearWideCameraView: View {
     @State private var showPicker = false
     @StateObject private var torch = TorchMonitor()
     @State private var correctPerspective = true
-    @AppStorage("minimumMagnification") private var minimumMagnification: Double = 1.5
+    @AppStorage("minimumMagnification") private var minimumMagnification: Double = 3
     @Environment(\.scenePhase) private var scenePhase
     
     private static let sfSymbolSize: CGFloat = 60
@@ -442,74 +442,125 @@ struct RearWideCameraView: View {
     }
 }
 
-final class PreviewView: UIView {
+/// Renders CIImage directly to a CAMetalDrawable (GPU-only path).
+final class PreviewMetalView: MTKView {
 
-    // Use a plain CALayer so we can set `.contents`
-    override class var layerClass: AnyClass { CALayer.self }
-
-    private let ciContext = CIContext() // Metal-backed by default
-    private let displayQueue = DispatchQueue(label: "PreviewView.display", qos: .userInitiated)
-
-    /// Forward to underlying CALayer for convenience
-    var contentsGravity: CALayerContentsGravity {
-        get { layer.contentsGravity }
-        set { layer.contentsGravity = newValue }
+    private let ciContext: CIContext
+    private let commandQueue: MTLCommandQueue
+    private var currentImage: CIImage?
+    private var currentOrientation: CGImagePropertyOrientation = .right
+    /// Mimic CALayer.contentsGravity behavior
+    var contentsGravity: CALayerContentsGravity = .resizeAspectFill {
+        didSet { setNeedsDisplay() }
     }
 
-    override init(frame: CGRect) {
-        super.init(frame: frame)
-        layer.contentsGravity = .resizeAspectFill
-        layer.isGeometryFlipped = false
-        layer.masksToBounds = true
+    // MARK: - Init
+
+    override init(frame: CGRect = .zero, device: MTLDevice? = MTLCreateSystemDefaultDevice()) {
+        let device = device ?? MTLCreateSystemDefaultDevice()!
+        self.ciContext = CIContext(mtlDevice: device)
+        self.commandQueue = device.makeCommandQueue()!
+        super.init(frame: frame, device: device)
+
+        // Allow Core Image to write into the drawable's texture.
+        framebufferOnly = false
+        isPaused = true            // manual redraws via setNeedsDisplay()/draw()
+        enableSetNeedsDisplay = true
+        colorPixelFormat = .bgra8Unorm_srgb
+        // Match UIKit’s default "top-left origin"
+        isOpaque = true
     }
 
-    required init?(coder: NSCoder) {
+    required init(coder: NSCoder) {
+        let device = MTLCreateSystemDefaultDevice()!
+        self.ciContext = CIContext(mtlDevice: device)
+        self.commandQueue = device.makeCommandQueue()!
         super.init(coder: coder)
-        layer.contentsGravity = .resizeAspectFill
-        layer.isGeometryFlipped = false
-        layer.masksToBounds = true
+        self.device = device
+
+        framebufferOnly = false
+        isPaused = true
+        enableSetNeedsDisplay = true
+        colorPixelFormat = .bgra8Unorm_srgb
+        isOpaque = true
     }
 
-    /// Display a CIImage (fastest path when you already have CIImage)
     func display(ciImage: CIImage, oriented orientation: CGImagePropertyOrientation = .right) {
-        let image = ciImage.oriented(orientation)
-        renderAndSetContents(ciImage: image)
+        currentOrientation = orientation
+        currentImage = ciImage
+        setNeedsDisplay()
     }
 
-    /// Display a CVPixelBuffer
-    func display(pixelBuffer: CVPixelBuffer) {
-        let ciImage = CIImage(cvPixelBuffer: pixelBuffer).oriented(.right)
-        renderAndSetContents(ciImage: ciImage)
-    }
+    // MARK: - Drawing
 
-    /// Display a CGImage (if you already converted upstream)
-    func display(cgImage: CGImage) {
-        // Setting .contents must occur on main; disable implicit animations to avoid flicker
-        DispatchQueue.main.async {
-            CATransaction.begin()
-            CATransaction.setDisableActions(true)
-            self.layer.contents = cgImage
-            CATransaction.commit()
+    override func draw(_ rect: CGRect) {
+        guard let image = currentImage,
+              let drawable = currentDrawable,
+              let commandBuffer = commandQueue.makeCommandBuffer()
+        else { return }
+
+        // Apply orientation first (done on GPU as part of CI pipeline).
+        let oriented = image.oriented(currentOrientation)
+
+        // Compute fitted image rect in view space depending on "gravity".
+        let fitted = fittedImage(oriented, for: drawableSize, gravity: contentsGravity)
+
+        // Render directly into the drawable’s texture.
+        // IMPORTANT: MTKView.framebufferOnly = false ensures usage includes shader write.
+        let dest = CIRenderDestination(mtlTexture: drawable.texture, commandBuffer: commandBuffer)
+        dest.isFlipped = true // UIKit/MTKView coordinate flip
+
+        do {
+            try ciContext.startTask(toRender: fitted, to: dest)
+        } catch {
+            // Fallback (very rare): render to an intermediate texture then blit (omitted for brevity)
+            print("CI render error: \(error)")
         }
+
+        commandBuffer.present(drawable)
+        commandBuffer.commit()
     }
 
-    // MARK: - Private
+    // MARK: - Helpers
 
-    private func renderAndSetContents(ciImage: CIImage) {
-        // Render off the main thread, then set .contents on the main thread.
-        displayQueue.async {
-            let rect = ciImage.extent
-            // Use sRGB color space to avoid washed out colors
-            let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)
-            guard let cgImage = self.ciContext.createCGImage(ciImage, from: rect, format: .RGBA8, colorSpace: colorSpace) else { return }
+    /// Returns a version of `image` transformed to fit the drawable size with aspect rules.
+    private func fittedImage(_ image: CIImage,
+                             for drawableSize: CGSize,
+                             gravity: CALayerContentsGravity) -> CIImage {
+        guard image.extent.width > 0, image.extent.height > 0,
+              drawableSize.width > 0, drawableSize.height > 0
+        else { return image }
 
-            DispatchQueue.main.async {
-                CATransaction.begin()
-                CATransaction.setDisableActions(true)
-                self.layer.contents = cgImage
-                CATransaction.commit()
-            }
+        let src = image.extent
+        let dst = CGRect(origin: .zero, size: drawableSize)
+
+        let sx = dst.width  / src.width
+        let sy = dst.height / src.height
+
+        let scale: CGFloat
+        switch gravity {
+        case .resizeAspect:     scale = min(sx, sy)
+        case .resizeAspectFill: scale = max(sx, sy)
+        case .resize:           scale = 1.0 // stretch later
+        default:                scale = max(sx, sy) // default to fill
         }
+
+        var transformed = image.transformed(by:
+            CGAffineTransform(scaleX: scale, y: scale)
+        )
+
+        let newExtent = transformed.extent
+        let tx = (dst.width  - newExtent.width)  * 0.5
+        let ty = (dst.height - newExtent.height) * 0.5
+
+        transformed = transformed.transformed(by: CGAffineTransform(translationX: tx, y: ty))
+
+        if gravity == .resize {
+            // Non-uniform scale to exactly fill bounds
+            let stretch = CGAffineTransform(a: sx, b: 0, c: 0, d: sy, tx: 0, ty: 0)
+            transformed = image.transformed(by: stretch)
+        }
+        return transformed
     }
 }
 
@@ -541,7 +592,7 @@ struct CameraPreview: UIViewRepresentable {
         container.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         scroll.addSubview(container)
         // Live preview
-        let preview = PreviewView()
+        let preview = PreviewMetalView()
         preview.frame = container.bounds
         preview.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         container.addSubview(preview)
@@ -582,7 +633,7 @@ struct CameraPreview: UIViewRepresentable {
         private weak var session: AVCaptureSession?
         weak var scrollView: UIScrollView?
         weak var container: UIView?
-        weak var preview: PreviewView?
+        weak var preview: PreviewMetalView?
         weak var overlay: UIImageView?
         private var filterMode: FilterMode = .none
         private let ciContext = CIContext()
@@ -829,7 +880,9 @@ struct CameraPreview: UIViewRepresentable {
                         }
                         prepareToFreeze = false
                     }
-                    self.preview?.display(ciImage: leveled)
+                    DispatchQueue.main.async {
+                        self.preview?.display(ciImage: leveled)
+                    }
                 }
                 print("total frame processing time \(Date().timeIntervalSince(frameStart))")
                 self.processingFrame = false
