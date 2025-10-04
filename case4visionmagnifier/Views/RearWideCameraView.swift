@@ -852,7 +852,7 @@ struct CameraPreview: UIViewRepresentable {
                 overlay.isHidden = true
                 preview.isHidden = false
             }
-            if !isFrozen {
+            if !isFrozen && frozen {
                 prepareToFreeze = true
             }
             isFrozen = frozen
