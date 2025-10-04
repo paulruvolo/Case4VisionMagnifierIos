@@ -571,9 +571,6 @@ struct CameraPreview: UIViewRepresentable {
     func updateUIView(_ scroll: UIScrollView, context: Context) {
         context.coordinator.applyDoPerspectiveCorrection(doPerspectiveCorrection)
         context.coordinator.applyMinimumMagnification(minimumMagnification)
-        if isFrozen {
-            context.coordinator.prepareToFreeze = true
-        }
         context.coordinator.applyFreeze(isFrozen)
         context.coordinator.setFilterMode(filterMode)
         context.coordinator.centerContent()
@@ -605,6 +602,7 @@ struct CameraPreview: UIViewRepresentable {
         let device = MTLCreateSystemDefaultDevice()!
         /// this flag communicates to the renderer and warper that we should prepare a UIImage from the result (this is a costly operation that shouldn't be done every frame)
         var prepareToFreeze = false
+        var isFrozen = false
         
         let psDesc = MTLRenderPipelineDescriptor()
         let library: MTLLibrary
@@ -854,6 +852,10 @@ struct CameraPreview: UIViewRepresentable {
                 overlay.isHidden = true
                 preview.isHidden = false
             }
+            if !isFrozen {
+                prepareToFreeze = true
+            }
+            isFrozen = frozen
             // Recenter after the visibility change, even if no zoom yet.
             DispatchQueue.main.async { [weak self] in
                 guard let self = self, let scroll = self.scrollView else {

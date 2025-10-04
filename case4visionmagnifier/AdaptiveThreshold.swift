@@ -103,8 +103,8 @@ final class AdaptiveThreshColorized {
     
     // MARK: - Public: call me each frame
     func processFrame(ciImage: CIImage, filterMode: FilterMode)->CIImage? {
-        let dstW = Int(ciImage.extent.width)*CameraPreview.Coordinator.destinationTextureScaleFactor
-        let dstH = Int(ciImage.extent.height)*CameraPreview.Coordinator.destinationTextureScaleFactor
+        let dstW = Int(ciImage.extent.width)
+        let dstH = Int(ciImage.extent.height)
         print(dstW, dstH)
 
         // 1) Make a source texture from the CIImage (GPU path, no CPU readback)
