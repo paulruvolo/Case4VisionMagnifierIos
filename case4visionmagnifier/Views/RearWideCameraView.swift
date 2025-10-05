@@ -422,12 +422,7 @@ struct RearWideCameraView: View {
         }
         .alert(item: $model.alert) { alert in
             Alert(title: Text(alert.title), message: Text(alert.message), dismissButton: .default(Text("OK")))
-        }.onAppear {
-            AppDelegate.orientationLock = .landscapeRight
-        }.onDisappear {
-            AppDelegate.orientationLock = .all // restore
-        }
-        .onChange(of: scenePhase) { (oldPhase, newPhase) in
+        }.onChange(of: scenePhase) { (oldPhase, newPhase) in
             // When returning from Settings app, values are synced.
             // No manual synchronize needed; this ensures re-render happens.
             if newPhase == .active { _ = minimumMagnification } // touch to trigger view update if needed

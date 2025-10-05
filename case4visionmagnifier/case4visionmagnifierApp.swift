@@ -10,7 +10,7 @@ import UIKit
 
 // 1) App delegate exposes a mutable orientation lock
 class AppDelegate: NSObject, UIApplicationDelegate {
-    static var orientationLock = UIInterfaceOrientationMask.all
+    static var orientationLock = UIInterfaceOrientationMask.landscapeRight
 
     func application(_ application: UIApplication,
                      supportedInterfaceOrientationsFor window: UIWindow?)
@@ -19,7 +19,6 @@ class AppDelegate: NSObject, UIApplicationDelegate {
         Self.orientationLock
     }
 }
-
 
 @main
 struct case4visionmagnifierApp: App {
