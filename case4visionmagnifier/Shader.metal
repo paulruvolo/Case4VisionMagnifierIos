@@ -39,6 +39,9 @@ fragment float4 fs_warp(VSOut in [[stage_in]],
     if (any(srcUV < 0.0) || any(srcUV > 1.0)) {
         return float4(0.0, 0.0, 0.0, U.oobAlpha); // background fill
     }
+    
+    // Flip the sampled source vertically:
+    srcUV.y = 1.0 - srcUV.y;
 
     return src.sample(samp, srcUV);
 }

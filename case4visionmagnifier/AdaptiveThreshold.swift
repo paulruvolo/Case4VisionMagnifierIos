@@ -29,12 +29,10 @@ final class AdaptiveThreshColorized {
     }
 
     /// srcBGRA/dstBGRA: MTLPixelFormat.bgra8Unorm
-    func run(ciImage: CIImage,
-             srcBGRA: MTLTexture,
+    func run(srcBGRA: MTLTexture,
              dstBGRA: MTLTexture,
              blockSize: Int,
-             method: Method = .mean,
-             C: Float,                    // OpenCV's C (e.g., 10) -> pass C/255
+             C: Float,
              binaryInv: Bool = false,
              fg: SIMD4<Float>,            // 0..1 linear
              bg: SIMD4<Float>)            // 0..1 linear
@@ -53,25 +51,11 @@ final class AdaptiveThreshColorized {
         guard let blurred = device.makeTexture(descriptor: blurDesc) else { return }
 
         // 2) blur via MPS
-        if method == .mean {
-            let k = max(1, blockSize | 1)
-            let box = MPSImageBox(device: device, kernelWidth: k, kernelHeight: k)
-            box.edgeMode = .clamp
-            box.encode(commandBuffer: cmd, sourceTexture: srcBGRA, destinationTexture: blurred)
-        } else {
-            let sigma = max(0.5, Float(blockSize) / 6.0)
-            let g = MPSImageGaussianBlur(device: device, sigma: sigma)
-            g.edgeMode = .mirror
-            g.encode(commandBuffer: cmd, sourceTexture: srcBGRA, destinationTexture: blurred)
-        }
+        let k = max(1, blockSize | 1)
+        let box = MPSImageBox(device: device, kernelWidth: k, kernelHeight: k)
+        box.edgeMode = .clamp
+        box.encode(commandBuffer: cmd, sourceTexture: srcBGRA, destinationTexture: blurred)
 
-        // Render the CIImage into srcTex
-        ciContext.render(ciImage,
-                         to: srcBGRA,
-                         commandBuffer: cmd,
-                         bounds: ciImage.extent,
-                         colorSpace: CGColorSpaceCreateDeviceRGB())
-        
         // 3) compare → colorized BGRA
         guard let enc = cmd.makeComputeCommandEncoder() else { return }
         enc.setComputePipelineState(pso)
@@ -101,28 +85,10 @@ final class AdaptiveThreshColorized {
         SIMD4(Float(r)/255, Float(g)/255, Float(b)/255, Float(a)/255)
     }
     
-    // MARK: - Public: call me each frame
-    func processFrame(ciImage: CIImage, filterMode: FilterMode)->CIImage? {
-        let dstW = Int(ciImage.extent.width)
-        let dstH = Int(ciImage.extent.height)
-        print(dstW, dstH)
-
-        // 1) Make a source texture from the CIImage (GPU path, no CPU readback)
-        let srcTex: MTLTexture = {
-            // Reuse a texture of the right size
-            if srcScratchTex == nil ||
-               srcScratchTex!.width  != Int(ciImage.extent.width) ||
-               srcScratchTex!.height != Int(ciImage.extent.height) {
-                let td = MTLTextureDescriptor.texture2DDescriptor(
-                    pixelFormat: .bgra8Unorm,
-                    width: Int(ciImage.extent.width),
-                    height: Int(ciImage.extent.height),
-                    mipmapped: false)
-                td.usage = [.shaderRead, .shaderWrite, .renderTarget]
-                srcScratchTex = device.makeTexture(descriptor: td)
-            }
-            return srcScratchTex!
-        }()
+    // MARK: - Public: called each frame
+    func processFrame(srcTex: MTLTexture, filterMode: FilterMode)->MTLTexture? {
+        let dstW = Int(srcTex.width)
+        let dstH = Int(srcTex.height)
 
         // Destination texture (warp render target)
         if dstScratchTex == nil ||
@@ -152,19 +118,13 @@ final class AdaptiveThreshColorized {
             bg = rgbaBytesToLinear(0, 0, 0)
         }
         let dstTex = dstScratchTex!
-        run(ciImage: ciImage,
-            srcBGRA: srcTex,
+        run(srcBGRA: srcTex,
             dstBGRA: dstTex,
             blockSize: 101,
-            method: .mean,
-            C: 50,
+            C: 30,
             binaryInv: true,
             fg: fg,
             bg: bg)
-        let outCI = CIImage(
-            mtlTexture: dstTex,
-            options: [.colorSpace: CGColorSpaceCreateDeviceRGB()]
-        )!.oriented(.up)
-        return outCI
+        return dstTex
     }
 }

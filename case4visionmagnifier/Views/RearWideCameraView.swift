@@ -20,39 +20,35 @@ final class WarpRenderer {
     // MARK: - Metal / CI
     let device: MTLDevice
     let queue: MTLCommandQueue
-    let ciContext: CIContext
     let pipeline: MTLRenderPipelineState
     let sampler: MTLSamplerState
     // Off-screen textures (reused & resized as needed)
-    private var srcScratchTex: MTLTexture? // holds the input CIImage
     private var dstScratchTex: MTLTexture? // render target for warped output
     // (If you have a CVPixelBuffer, also keep a CVMetalTextureCache)
 
     struct WarpUniforms { var M: simd_float3x3; var oobAlpha: Float }
 
-    init?() {
-        guard let dev = MTLCreateSystemDefaultDevice(),
-              let q = dev.makeCommandQueue() else { return nil }
-        device = dev
+    init?(device: MTLDevice) {
+        guard let q = device.makeCommandQueue() else { return nil }
+        self.device = device
         queue = q
-        ciContext = CIContext(mtlDevice: dev, options: [ .useSoftwareRenderer: false ])
 
         // Pipeline (matches the shader names we discussed earlier)
-        let lib = dev.makeDefaultLibrary()!
+        let lib = device.makeDefaultLibrary()!
         let vfn = lib.makeFunction(name: "vs_fullscreen_triangle")!
         let ffn = lib.makeFunction(name: "fs_warp")!
         let p = MTLRenderPipelineDescriptor()
         p.vertexFunction = vfn
         p.fragmentFunction = ffn
         p.colorAttachments[0].pixelFormat = .bgra8Unorm
-        pipeline = try! dev.makeRenderPipelineState(descriptor: p)
+        pipeline = try! device.makeRenderPipelineState(descriptor: p)
 
         let sd = MTLSamplerDescriptor()
         sd.minFilter = .linear
         sd.magFilter = .linear
         sd.sAddressMode = .clampToEdge
         sd.tAddressMode = .clampToEdge
-        sampler = dev.makeSamplerState(descriptor: sd)!
+        sampler = device.makeSamplerState(descriptor: sd)!
     }
 
     /// Build a translation transform as a 3x3 matrix (operates on homogeneous coordinates)
@@ -90,7 +86,6 @@ final class WarpRenderer {
         simd_float3x3(columns: (SIMD3(W,0,0), SIMD3(0,H,0), SIMD3(0,0,1)))
     }
     
-    
     /// Use the given transform (usually a homography) to project the pixel coordinate x, y
     /// - Parameters:
     ///   - H: the projective transform (e.g., a homography)
@@ -119,12 +114,13 @@ final class WarpRenderer {
         let Wf = Float(W), Hf = Float(Hgt)
         let center = SIMD2(Wf*0.5, Hf*0.5)
         let Hinv = H_srcToDst.inverse
-
-        // Raw projected quad (dest pixel coords)
-        let tl = project(Hinv, 0,    0)
-        let tr = project(Hinv, Wf,   0)
-        let bl = project(Hinv, 0,   Hf)
-        let br = project(Hinv, Wf,  Hf)
+        // scale based on maintaining area of the warped quadrilateral around the center pixel
+        let centerOffset = Float(5.0)
+        // Raw projected quad around center
+        let tl = project(Hinv, Wf*0.5-centerOffset,    Hf*0.5-centerOffset)
+        let tr = project(Hinv, Wf*0.5+centerOffset,  Hf*0.5-centerOffset)
+        let bl = project(Hinv, Wf*0.5-centerOffset,   Hf*0.5+centerOffset)
+        let br = project(Hinv, Wf*0.5+centerOffset,  Hf*0.5+centerOffset)
 
         // Center alignment
         let srcCenterInDst = project(Hinv, Wf*0.5, Hf*0.5)
@@ -132,7 +128,7 @@ final class WarpRenderer {
 
         // Area matching
         let rawArea = quadArea([tl, bl, br, tr])
-        let srcArea = Wf * Hf
+        let srcArea = centerOffset * centerOffset
         let s = 1.0/(sqrt(max(1e-8, srcArea / max(1e-8, rawArea))))
 
         // Pre-warp dest transform A (pixels)
@@ -145,27 +141,9 @@ final class WarpRenderer {
     }
 
     // MARK: - Public: call me each frame
-    func processFrame(ciImage: CIImage, H: simd_float3x3)->CIImage? {
-        let dstW = Int(ciImage.extent.width)*CameraPreview.Coordinator.destinationTextureScaleFactor
-        let dstH = Int(ciImage.extent.height)*CameraPreview.Coordinator.destinationTextureScaleFactor
-        print(dstW, dstH)
-
-        // 1) Make a source texture from the CIImage (GPU path, no CPU readback)
-        let srcTex: MTLTexture = {
-            // Reuse a texture of the right size
-            if srcScratchTex == nil ||
-               srcScratchTex!.width  != Int(ciImage.extent.width) ||
-               srcScratchTex!.height != Int(ciImage.extent.height) {
-                let td = MTLTextureDescriptor.texture2DDescriptor(
-                    pixelFormat: .bgra8Unorm,
-                    width: Int(ciImage.extent.width),
-                    height: Int(ciImage.extent.height),
-                    mipmapped: false)
-                td.usage = [.shaderRead, .shaderWrite, .renderTarget]
-                srcScratchTex = device.makeTexture(descriptor: td)
-            }
-            return srcScratchTex!
-        }()
+    func processFrame(srcTex: MTLTexture, H: simd_float3x3)->MTLTexture? {
+        let dstW = Int(srcTex.width)*CameraPreview.Coordinator.destinationTextureScaleFactor
+        let dstH = Int(srcTex.height)*CameraPreview.Coordinator.destinationTextureScaleFactor
 
         // Destination texture (warp render target)
         if dstScratchTex == nil ||
@@ -181,12 +159,6 @@ final class WarpRenderer {
         
         let cmd = queue.makeCommandBuffer()!
 
-        // Render the CIImage into srcTex
-        ciContext.render(ciImage,
-                         to: srcTex,
-                         commandBuffer: cmd,
-                         bounds: ciImage.extent,
-                         colorSpace: CGColorSpaceCreateDeviceRGB())
         // 2) Warp pass into dstTex
         let rp = MTLRenderPassDescriptor()
         rp.colorAttachments[0].texture = dstTex
@@ -210,13 +182,7 @@ final class WarpRenderer {
         cmd.commit()
         cmd.waitUntilCompleted() // ensure the texture is ready to read
 
-        // --- Wrap as CIImage (GPU-backed) --
-        let outCI = CIImage(
-            mtlTexture: dstTex,
-            options: [.colorSpace: CGColorSpaceCreateDeviceRGB()]
-        )!.oriented(.rightMirrored)
-
-        return outCI
+        return dstTex
     }
 }
 
@@ -237,7 +203,6 @@ struct RearWideCameraView: View {
     @State private var includeGuides = false
     @State private var showPicker = false
     @StateObject private var torch = TorchMonitor()
-    @State private var correctPerspective = true
     @AppStorage("minimumMagnification") private var minimumMagnification: Double = 3
     @Environment(\.scenePhase) private var scenePhase
     
@@ -272,12 +237,11 @@ struct RearWideCameraView: View {
     var body: some View {
         ZStack {
             if let session = model.session {
-                CameraPreview(session: session, isFrozen: $isFrozen, filterMode: $filterMode, minimumMagnification: $minimumMagnification, doPerspectiveCorrection: $correctPerspective)
+                CameraPreview(session: session, isFrozen: $isFrozen, filterMode: $filterMode, minimumMagnification: $minimumMagnification)
                     .ignoresSafeArea()
                     .onAppear {
                         model.start()
                         if let device = model.device {
-                            print("attaching!")
                             torch.attach(device: device)
                         }
                     }
@@ -345,7 +309,6 @@ struct RearWideCameraView: View {
                                 .first(where: { $0.device.hasMediaType(.video) }),
                                   videoInput.device.hasTorch else {
                                 return
-                                // e.g., toggle torch or adjust focus
                             }
                             let device = videoInput.device
                             if device.torchMode == .off {
@@ -382,17 +345,6 @@ struct RearWideCameraView: View {
                         .background(
                             Circle().fill(buttonBGColor) // solid circular background
                         )
-//                        Spacer()
-//                        Button(action: { self.settingsOpener()} ){
-//                            Text("Open Settings")
-//                        }
-//                        .fontWeight(.bold)
-//                        .padding()
-//                        .background(
-//                            RoundedRectangle(cornerRadius: 12)
-//                                .stroke(Color.blue, lineWidth: 5)
-//                                .fill(Color.white)
-//                        )
                         Spacer()
                         Button(action: {
                             includeGuides.toggle()
@@ -428,134 +380,225 @@ struct RearWideCameraView: View {
             if newPhase == .active { _ = minimumMagnification } // touch to trigger view update if needed
         }
     }
-    private func settingsOpener(){
-        if let url = URL(string: UIApplication.openSettingsURLString) {
-            if UIApplication.shared.canOpenURL(url) {
-                UIApplication.shared.open(url, options: [:], completionHandler: nil)
-            }
-        }
-    }
 }
 
-/// Renders CIImage directly to a CAMetalDrawable (GPU-only path).
 final class PreviewMetalView: MTKView {
-
-    private let ciContext: CIContext
     private let commandQueue: MTLCommandQueue
-    private var currentImage: CIImage?
-    private var currentOrientation: CGImagePropertyOrientation = .right
+    private var srcTexture: MTLTexture?
+    var clearTexture: MTLTexture?  // black texture sized to current drawable
+
     /// Mimic CALayer.contentsGravity behavior
     var contentsGravity: CALayerContentsGravity = .resizeAspectFill {
         didSet { setNeedsDisplay() }
     }
 
-    // MARK: - Init
-
     override init(frame: CGRect = .zero, device: MTLDevice? = MTLCreateSystemDefaultDevice()) {
         let device = device ?? MTLCreateSystemDefaultDevice()!
-        self.ciContext = CIContext(mtlDevice: device)
         self.commandQueue = device.makeCommandQueue()!
         super.init(frame: frame, device: device)
-
-        // Allow Core Image to write into the drawable's texture.
-        framebufferOnly = false
-        isPaused = true            // manual redraws via setNeedsDisplay()/draw()
+        isPaused = true
         enableSetNeedsDisplay = true
-        colorPixelFormat = .bgra8Unorm_srgb
-        // Match UIKit’s default "top-left origin"
+        framebufferOnly = false
         isOpaque = true
+        colorPixelFormat = .bgra8Unorm
+        autoResizeDrawable = false
     }
 
     required init(coder: NSCoder) {
         let device = MTLCreateSystemDefaultDevice()!
-        self.ciContext = CIContext(mtlDevice: device)
         self.commandQueue = device.makeCommandQueue()!
         super.init(coder: coder)
         self.device = device
-
-        framebufferOnly = false
         isPaused = true
         enableSetNeedsDisplay = true
-        colorPixelFormat = .bgra8Unorm_srgb
+        framebufferOnly = false
         isOpaque = true
+        colorPixelFormat = .bgra8Unorm
+        autoResizeDrawable = false
     }
 
-    func display(ciImage: CIImage, oriented orientation: CGImagePropertyOrientation = .right) {
-        currentOrientation = orientation
-        currentImage = ciImage
+    // Keep drawableSize = view's pixel size to avoid CAMetalLayer stretching.
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        drawableSize = CGSize(width: bounds.width * contentScaleFactor,
+                              height: bounds.height * contentScaleFactor)
+        clearTexture = nil // force re-make at new size
+    }
+
+    /// Public entry: just stash and trigger a draw
+    func draw(texture: MTLTexture) {
+        self.srcTexture = texture
         setNeedsDisplay()
     }
 
-    // MARK: - Drawing
-
     override func draw(_ rect: CGRect) {
-        guard let image = currentImage,
-              let drawable = currentDrawable,
-              let commandBuffer = commandQueue.makeCommandBuffer()
-        else { return }
+        guard let drawable = currentDrawable,
+              let src = srcTexture,
+              let cmd = commandQueue.makeCommandBuffer(),
+              let blit = cmd.makeBlitCommandEncoder() else { return }
 
-        // Apply orientation first (done on GPU as part of CI pipeline).
-        let oriented = image.oriented(currentOrientation)
-
-        // Compute fitted image rect in view space depending on "gravity".
-        let fitted = fittedImage(oriented, for: drawableSize, gravity: contentsGravity)
-
-        // Render directly into the drawable’s texture.
-        // IMPORTANT: MTKView.framebufferOnly = false ensures usage includes shader write.
-        let dest = CIRenderDestination(mtlTexture: drawable.texture, commandBuffer: commandBuffer)
-        dest.isFlipped = true // UIKit/MTKView coordinate flip
-
-        do {
-            try ciContext.startTask(toRender: fitted, to: dest)
-        } catch {
-            // Fallback (very rare): render to an intermediate texture then blit (omitted for brevity)
-            print("CI render error: \(error)")
+        // 1) Clear the drawable using a black texture via blit
+        ensureClearTexture(for: drawable.texture)
+        if let clearTex = clearTexture {
+            let full = MTLSize(width: drawable.texture.width, height: drawable.texture.height, depth: 1)
+            blit.copy(from: clearTex,
+                      sourceSlice: 0, sourceLevel: 0,
+                      sourceOrigin: .init(x: 0, y: 0, z: 0),
+                      sourceSize: full,
+                      to: drawable.texture,
+                      destinationSlice: 0, destinationLevel: 0,
+                      destinationOrigin: .init(x: 0, y: 0, z: 0))
         }
 
-        commandBuffer.present(drawable)
-        commandBuffer.commit()
+        // 2) Compute copy regions for aspect-fit/fill (no scaling)
+        let dstW = drawable.texture.width
+        let dstH = drawable.texture.height
+        let srcW = src.width
+        let srcH = src.height
+
+        let regions = computeCopyRegions(srcW: srcW, srcH: srcH, dstW: dstW, dstH: dstH, gravity: contentsGravity)
+
+        // 3) Blit the selected source region into the centered destination origin (same size)
+        if regions.size.width > 0 && regions.size.height > 0 {
+            blit.copy(from: src,
+                      sourceSlice: 0, sourceLevel: 0,
+                      sourceOrigin: regions.srcOrigin,
+                      sourceSize: regions.size,
+                      to: drawable.texture,
+                      destinationSlice: 0, destinationLevel: 0,
+                      destinationOrigin: regions.dstOrigin)
+        }
+
+        blit.endEncoding()
+        cmd.present(drawable)
+        cmd.commit()
     }
 
     // MARK: - Helpers
 
-    /// Returns a version of `image` transformed to fit the drawable size with aspect rules.
-    private func fittedImage(_ image: CIImage,
-                             for drawableSize: CGSize,
-                             gravity: CALayerContentsGravity) -> CIImage {
-        guard image.extent.width > 0, image.extent.height > 0,
-              drawableSize.width > 0, drawableSize.height > 0
-        else { return image }
+    private func ensureClearTexture(for like: MTLTexture) {
+        guard clearTexture == nil ||
+              clearTexture!.width  != like.width ||
+              clearTexture!.height != like.height else { return }
 
-        let src = image.extent
-        let dst = CGRect(origin: .zero, size: drawableSize)
+        let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: like.pixelFormat,
+                                                            width: like.width,
+                                                            height: like.height,
+                                                            mipmapped: false)
+        desc.usage = [.shaderRead, .shaderWrite] // generous; read/write not strictly needed
+        guard let tex = device?.makeTexture(descriptor: desc) else { return }
 
-        let sx = dst.width  / src.width
-        let sy = dst.height / src.height
+        // Fill with zeros on CPU (bgra8Unorm -> black/opaque=0,0,0,0; if you prefer 1.0 alpha, still 0 here is fine for background)
+        let bytesPerPixel = 4
+        let rowBytes = like.width * bytesPerPixel
+        let zeroes = [UInt8](repeating: 0, count: rowBytes * like.height)
+        zeroes.withUnsafeBytes { ptr in
+            let region = MTLRegionMake2D(0, 0, like.width, like.height)
+            tex.replace(region: region, mipmapLevel: 0, withBytes: ptr.baseAddress!, bytesPerRow: rowBytes)
+        }
+        clearTexture = tex
+    }
 
-        let scale: CGFloat
+    private struct CopyRegions {
+        let srcOrigin: MTLOrigin
+        let dstOrigin: MTLOrigin
+        let size: MTLSize
+    }
+
+    /// Compute source crop (no scaling) and destination origin for aspect-fit/fill.
+    private func computeCopyRegions(srcW: Int, srcH: Int, dstW: Int, dstH: Int,
+                                    gravity: CALayerContentsGravity) -> CopyRegions
+    {
+        let srcAR = Double(srcW) / Double(srcH)
+        let dstAR = Double(dstW) / Double(dstH)
+
+        // Start with defaults
+        var copyW = min(srcW, dstW)
+        var copyH = min(srcH, dstH)
+        var srcX = 0
+        var srcY = 0
+        var dstX = (dstW - copyW) / 2
+        var dstY = (dstH - copyH) / 2
+
         switch gravity {
-        case .resizeAspect:     scale = min(sx, sy)
-        case .resizeAspectFill: scale = max(sx, sy)
-        case .resize:           scale = 1.0 // stretch later
-        default:                scale = max(sx, sy) // default to fill
+        case .resizeAspectFill:
+            // Fill the destination: choose a source crop with the destination's aspect ratio and (ideally) the destination size.
+            // If source is at least as large as destination in both axes, we can crop source to exactly dst size.
+            if srcW >= dstW && srcH >= dstH {
+                // Crop source to dst aspect, then take a dst-sized window from that crop.
+                // Compute maximal crop with dst aspect inside source.
+                // Option A: width-limited crop
+                var cropW = srcW
+                var cropH = Int((Double(cropW) / dstAR).rounded(.toNearestOrAwayFromZero))
+                if cropH > srcH {
+                    print("height is the limiter")
+
+                    // Height is the limiter
+                    cropH = srcH
+                    cropW = Int((Double(cropH) * dstAR).rounded(.toNearestOrAwayFromZero))
+                }
+                // Now from that crop, take a dst-sized window centered (no scaling)
+                // Because src >= dst in both axes, it's safe to take dst size directly.
+                copyW = dstW
+                copyH = dstH
+                srcX  = (srcW - copyW) / 2
+                srcY  = (srcH - copyH) / 2
+                dstX  = 0
+                dstY  = 0
+                print("copyW \(copyW) copyH \(copyH)")
+            } else {
+                // Source too small to truly fill without scaling; fall back to centered 1:1 copy.
+                // Keep aspect by limiting to the smaller limiting dimension relative to destination.
+                if dstAR > srcAR {
+                    // Destination wider: height-limited by src
+                    copyH = min(srcH, dstH)
+                    copyW = min(Int((Double(copyH) * srcAR).rounded(.toNearestOrAwayFromZero)), dstW)
+                } else {
+                    // Destination taller: width-limited by src
+                    copyW = min(srcW, dstW)
+                    copyH = min(Int((Double(copyW) / srcAR).rounded(.toNearestOrAwayFromZero)), dstH)
+                }
+                srcX = (srcW - copyW) / 2
+                srcY = (srcH - copyH) / 2
+                dstX = (dstW - copyW) / 2
+                dstY = (dstH - copyH) / 2
+            }
+
+        case .resizeAspect:
+            // Fit inside destination: choose a destination box with source aspect (no scaling), center it.
+            if dstAR > srcAR {
+                // Destination wider than source aspect -> height limits
+                copyH = min(srcH, dstH)
+                copyW = min(Int((Double(copyH) * srcAR).rounded(.toNearestOrAwayFromZero)), dstW)
+            } else {
+                // Destination taller (or equal) -> width limits
+                copyW = min(srcW, dstW)
+                copyH = min(Int((Double(copyW) / srcAR).rounded(.toNearestOrAwayFromZero)), dstH)
+            }
+            srcX = (srcW - copyW) / 2  // center-crop if source larger
+            srcY = (srcH - copyH) / 2
+            dstX = (dstW - copyW) / 2  // center in destination (letterbox/pillarbox)
+            dstY = (dstH - copyH) / 2
+
+        default:
+            // .resize (stretch) or others: copy the largest common sub-rect 1:1, centered.
+            copyW = min(srcW, dstW)
+            copyH = min(srcH, dstH)
+            srcX = (srcW - copyW) / 2
+            srcY = (srcH - copyH) / 2
+            dstX = (dstW - copyW) / 2
+            dstY = (dstH - copyH) / 2
         }
 
-        var transformed = image.transformed(by:
-            CGAffineTransform(scaleX: scale, y: scale)
+        // Clamp sanity
+        copyW = max(0, min(copyW, min(srcW, dstW)))
+        copyH = max(0, min(copyH, min(srcH, dstH)))
+
+        return CopyRegions(
+            srcOrigin: MTLOrigin(x: srcX, y: srcY, z: 0),
+            dstOrigin: MTLOrigin(x: dstX, y: dstY, z: 0),
+            size: MTLSize(width: copyW, height: copyH, depth: 1)
         )
-
-        let newExtent = transformed.extent
-        let tx = (dst.width  - newExtent.width)  * 0.5
-        let ty = (dst.height - newExtent.height) * 0.5
-
-        transformed = transformed.transformed(by: CGAffineTransform(translationX: tx, y: ty))
-
-        if gravity == .resize {
-            // Non-uniform scale to exactly fill bounds
-            let stretch = CGAffineTransform(a: sx, b: 0, c: 0, d: sy, tx: 0, ty: 0)
-            transformed = image.transformed(by: stretch)
-        }
-        return transformed
     }
 }
 
@@ -564,7 +607,6 @@ struct CameraPreview: UIViewRepresentable {
     @Binding var isFrozen: Bool
     @Binding var filterMode: FilterMode
     @Binding var minimumMagnification: Double
-    @Binding var doPerspectiveCorrection: Bool
 
     var minZoom: CGFloat = 1.0
     var maxZoom: CGFloat = 10.0
@@ -615,7 +657,6 @@ struct CameraPreview: UIViewRepresentable {
     }
     
     func updateUIView(_ scroll: UIScrollView, context: Context) {
-        context.coordinator.applyDoPerspectiveCorrection(doPerspectiveCorrection)
         context.coordinator.applyMinimumMagnification(minimumMagnification)
         context.coordinator.applyFreeze(isFrozen)
         context.coordinator.setFilterMode(filterMode)
@@ -631,15 +672,12 @@ struct CameraPreview: UIViewRepresentable {
         weak var preview: PreviewMetalView?
         weak var overlay: UIImageView?
         private var filterMode: FilterMode = .none
-        private let ciContext = CIContext()
         private let sampleQueue = DispatchQueue(label: "freeze.preview.sample")
-        private var latestImage: CGImage?
         private let motion = CMMotionManager()
         private(set) var gravity: CMAcceleration?
         // camera intrinsics (pixels)
         private var K: simd_float3x3?
         private var processingFrame = false
-        private let ciCtx = CIContext(options: nil)
         private var doPerspectiveCorrection = true
         var renderer: WarpRenderer?
         var thresholder: AdaptiveThreshColorized?
@@ -649,11 +687,7 @@ struct CameraPreview: UIViewRepresentable {
         /// this flag communicates to the renderer and warper that we should prepare a UIImage from the result (this is a costly operation that shouldn't be done every frame)
         var prepareToFreeze = false
         var isFrozen = false
-        
-        let psDesc = MTLRenderPipelineDescriptor()
-        let library: MTLLibrary
-        let pipeline: MTLRenderPipelineState
-        let sampler: MTLSamplerState
+        private var mtlBridge = PixelBufferMetalBridge()
         static let destinationTextureScaleFactor = 1
         
         /// Start motion updates so we can access the gravity vector
@@ -670,28 +704,7 @@ struct CameraPreview: UIViewRepresentable {
             }
         }
         
-        func applyDoPerspectiveCorrection(_ perspectiveCorrection: Bool) {
-            doPerspectiveCorrection = perspectiveCorrection
-        }
         typealias vImagePoint = (Float, Float)
-
-        private func scale(_ p: vImagePoint, around: vImagePoint, byFactor factor: Float)->vImagePoint {
-            return ((p.0 - around.0)*factor + around.0, (p.1 - around.1)*factor + around.1)
-        }
-        
-        private func calcArea(vertices: [vImagePoint])->Float {
-            guard vertices.count == 4 else {
-                return 0.0
-            }
-            var area: Float = 0.0
-            let verticesAugmented = vertices + [vertices[0]]
-            for i in 0..<verticesAugmented.count - 1 {
-                let vi = verticesAugmented[i]
-                let viplus1 = verticesAugmented[i+1]
-                area += 0.5*(vi.0 - viplus1.0)*(vi.1 + viplus1.1)
-            }
-            return area
-        }
         
         func convertCIImageToCGImage(inputImage: CIImage) -> CGImage? {
             let context = CIContext(options: nil)
@@ -748,9 +761,9 @@ struct CameraPreview: UIViewRepresentable {
             }
         }
         
-        func applyHomographyToImage(ci: CIImage, H: simd_float3x3)->CIImage? {
+        func applyHomographyToImage(texture: MTLTexture, H: simd_float3x3)->MTLTexture? {
             if renderer == nil {
-                renderer = WarpRenderer()
+                renderer = WarpRenderer(device: device)
             }
             if thresholder == nil {
                 thresholder = try? AdaptiveThreshColorized(device: device)
@@ -763,25 +776,21 @@ struct CameraPreview: UIViewRepresentable {
             }
             
             if filterMode == .none {
-                return renderer.processFrame(ciImage: ci, H: H.inverse)
+                return renderer.processFrame(srcTex: texture, H: H.inverse)
             } else {
-                guard let thresholded = thresholder.processFrame(ciImage: ci, filterMode: filterMode) else {
+                guard let thresholded = thresholder.processFrame(srcTex: texture, filterMode: filterMode) else {
                     return nil
                 }
-                return renderer.processFrame(ciImage: thresholded, H: H.inverse)
+                return renderer.processFrame(srcTex: thresholded, H: H.inverse)
             }
         }
         
-        /// Adjust the UIImage based on the gravity vector as returned by the CoreMotion.
+        /// Adjust the texture based on the gravity vector as returned by the CoreMotion.
         /// We assume a landscape right orientation for the image
         /// - Parameters:
-        ///   - uiImage: the UIImage (e.g., from the camera feed or a freeze frame)
-        /// - Returns: the corrected CGImage if the transformation can be applied successfully (nil otherwise)
-        func rectifyToLevel(_ ci: CIImage) -> CIImage? {
-            guard doPerspectiveCorrection else {
-                // short circuiting and just returning input
-                return ci
-            }
+        ///   - uiImage: the texture that wraps the pixel buffer from the camera feed
+        /// - Returns: the corrected texture (nil otherwise)
+        func rectifyToLevel(_ texture: MTLTexture) -> MTLTexture? {
             guard let gravity = gravity else {
                 return nil
             }
@@ -789,7 +798,6 @@ struct CameraPreview: UIViewRepresentable {
                 // If intrinsics missing, just return input
                 return nil
             }
-            // TODO: maybe we can negate each of these entries and negate the from: axis
             let gravityVectorInCameraConventions = simd_float3(Float(gravity.y), Float(-gravity.x), Float(-gravity.z))
             let R = simd_float3x3(simd_quatf(from: simd_float3(0, 0, 1), to: gravityVectorInCameraConventions))
             var K_scaled = K
@@ -800,17 +808,11 @@ struct CameraPreview: UIViewRepresentable {
             K_scaled.columns.2.y *= s
             let H = K * R * simd_inverse(K_scaled)
             // correct for perspective
-            return applyHomographyToImage(ci: ci, H: H.inverse)
+            return applyHomographyToImage(texture: texture, H: H.inverse)
         }
 
         init(session: AVCaptureSession) {
             self.session = session
-            self.library = try! device.makeDefaultLibrary()!
-            psDesc.vertexFunction = library.makeFunction(name: "vs_fullscreen_triangle")
-            psDesc.fragmentFunction = library.makeFunction(name: "fs_warp")
-            psDesc.colorAttachments[0].pixelFormat = .bgra8Unorm
-            self.pipeline = try! device.makeRenderPipelineState(descriptor: psDesc)
-            self.sampler = device.makeSamplerState(descriptor: MTLSamplerDescriptor())! // default = linear, clamp
         }
         
         // Add (or reuse) a VideoDataOutput so we can grab the latest frame as UIImage
@@ -827,8 +829,9 @@ struct CameraPreview: UIViewRepresentable {
             }
             let out = AVCaptureVideoDataOutput()
             out.alwaysDiscardsLateVideoFrames = true
-            out.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarFullRange]
-            // fast
+            // we neeed kCVPixelFormatType_32BGRA to make our handling of the MTLTexture easier
+            out.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA, kCVPixelBufferMetalCompatibilityKey as String: true]
+
             if session.canAddOutput(out) {
                 session.addOutput(out)
             }
@@ -845,7 +848,6 @@ struct CameraPreview: UIViewRepresentable {
             }
         }
         
-        // Convert frames to UIImage and keep only the latest
         func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer:
                         CMSampleBuffer, from connection: AVCaptureConnection) {
             let frameStart = Date()
@@ -855,6 +857,7 @@ struct CameraPreview: UIViewRepresentable {
             }
             frameCountDown -= 1
             guard frameCountDown <= 0 else {
+                // drop this frame
                 return
             }
             frameCountDown = 1 + Self.framesToDrop
@@ -865,18 +868,24 @@ struct CameraPreview: UIViewRepresentable {
                     return
                 }
                 self.updateIntrinsicsIfNeeded(from: pb)
-                let ci = CIImage(cvPixelBuffer: pb)
-                if let leveled = self.rectifyToLevel(ci) {
-                    if prepareToFreeze {
-                        if let latestImage = convertCIImageToCGImage(inputImage: leveled) {
-                            DispatchQueue.main.async {
-                                overlay?.image = UIImage(cgImage: latestImage, scale: 1.0, orientation: .right)
-                            }
-                        }
-                        prepareToFreeze = false
-                    }
+                if let texture = mtlBridge.makeTexture(from: pb), let leveled = self.rectifyToLevel(texture) {
                     DispatchQueue.main.async {
-                        self.preview?.display(ciImage: leveled)
+                        self.preview?.draw(texture: leveled)
+                        if self.prepareToFreeze, let displayedTexture = self.preview?.currentDrawable?.texture {
+                            // this pipeline is very slow, so only do it when we are about to freeze
+                            let leveledCI = CIImage(
+                                mtlTexture: displayedTexture,
+                                options: [.colorSpace: CGColorSpaceCreateDeviceRGB()]
+                            )!.oriented(.rightMirrored)
+                            if let latestImage = self.convertCIImageToCGImage(inputImage: leveledCI) {
+                                DispatchQueue.main.async {
+                                    self.overlay?.image = UIImage(cgImage: latestImage, scale: 1.0, orientation: .right)
+                                    self.overlay?.isHidden = false
+                                    self.preview?.isHidden = true
+                                }
+                            }
+                            self.prepareToFreeze = false
+                        }
                     }
                 }
                 print("total frame processing time \(Date().timeIntervalSince(frameStart))")
@@ -893,10 +902,7 @@ struct CameraPreview: UIViewRepresentable {
             guard let overlay, let preview else {
                 return
             }
-            if frozen {
-                overlay.isHidden = false
-                preview.isHidden = true
-            } else {
+            if !frozen {
                 overlay.isHidden = true
                 preview.isHidden = false
             }
@@ -1084,6 +1090,9 @@ final class CameraModel: ObservableObject {
         // For preview-only, this isn’t required, but harmless.
         let output = AVCaptureVideoDataOutput()
         output.alwaysDiscardsLateVideoFrames = true
+        // we need kCVPixelFormatType_32BGRA to make our work with MTLTextures easier
+        output.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA, kCVPixelBufferMetalCompatibilityKey as String: true]
+
         if session.canAddOutput(output) {
             session.addOutput(output)
         }
@@ -1134,9 +1143,34 @@ struct CameraAlert: Identifiable {
     let message: String
 }
 
-// MARK: - Demo
-struct RearWideCameraDemo_Previews: PreviewProvider {
-    static var previews: some View {
-        RearWideCameraView()
+final class PixelBufferMetalBridge {
+    private let device = MTLCreateSystemDefaultDevice()!
+    private var cache: CVMetalTextureCache!
+
+    init() {
+        CVMetalTextureCacheCreate(kCFAllocatorDefault, nil, device, nil, &cache)
+    }
+
+    /// BGRA pixel buffer → BGRA8Unorm MTLTexture
+    func makeTexture(from pixelBuffer: CVPixelBuffer) -> MTLTexture? {
+        let width  = CVPixelBufferGetWidth(pixelBuffer)
+        let height = CVPixelBufferGetHeight(pixelBuffer)
+
+        var cvTex: CVMetalTexture?
+        let status = CVMetalTextureCacheCreateTextureFromImage(
+            kCFAllocatorDefault,
+            cache,
+            pixelBuffer,
+            nil,                       // textureAttributes
+            .bgra8Unorm,               // MTLTexture pixel format
+            width,
+            height,
+            0,                         // planeIndex (0 for single-plane)
+            &cvTex
+        )
+        guard status == kCVReturnSuccess, let cvTex, let tex = CVMetalTextureGetTexture(cvTex) else {
+            return nil
+        }
+        return tex
     }
 }
