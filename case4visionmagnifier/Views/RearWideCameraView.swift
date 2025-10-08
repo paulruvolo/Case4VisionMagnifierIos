@@ -25,13 +25,76 @@ final class WarpRenderer {
     // Off-screen textures (reused & resized as needed)
     private var dstScratchTex: MTLTexture? // render target for warped output
     // (If you have a CVPixelBuffer, also keep a CVMetalTextureCache)
+    var textureCache: CVMetalTextureCache!
 
     struct WarpUniforms { var M: simd_float3x3; var oobAlpha: Float }
+    
+    func pixelBufferFromTextureGPU(
+        _ texture: MTLTexture,
+        dstMTLPixelFormat: MTLPixelFormat = .bgra8Unorm,
+        dstCVPixelFormat: OSType = kCVPixelFormatType_32BGRA
+    ) -> CVPixelBuffer? {
+        precondition(texture.width > 0 && texture.height > 0)
 
+        // 1) Create IOSurface-backed CVPixelBuffer compatible with Metal
+        var pixelBuffer: CVPixelBuffer?
+        let attrs: [CFString: Any] = [
+            kCVPixelBufferMetalCompatibilityKey: true,
+            kCVPixelBufferIOSurfacePropertiesKey: [:] // <- required for IOSurface backing
+        ]
+        let status = CVPixelBufferCreate(
+            kCFAllocatorDefault,
+            texture.width,
+            texture.height,
+            dstCVPixelFormat,
+            attrs as CFDictionary,
+            &pixelBuffer
+        )
+        guard status == kCVReturnSuccess, let pb = pixelBuffer else { return nil }
+
+        // 2) Wrap CVPixelBuffer as a Metal texture
+        var cvMetalTex: CVMetalTexture?
+        let cvStatus = CVMetalTextureCacheCreateTextureFromImage(
+            kCFAllocatorDefault,
+            textureCache,
+            pb,
+            nil,
+            dstMTLPixelFormat,
+            texture.width,
+            texture.height,
+            0,
+            &cvMetalTex
+        )
+        guard cvStatus == kCVReturnSuccess,
+              let cvMTLTex = cvMetalTex,
+              let dst = CVMetalTextureGetTexture(cvMTLTex) else { return nil }
+
+        // 3) Encode a blit copy
+        guard let cmdBuf = queue.makeCommandBuffer(),
+              let blit = cmdBuf.makeBlitCommandEncoder() else { return nil }
+
+        let size = MTLSize(width: texture.width, height: texture.height, depth: 1)
+        blit.copy(from: texture,
+                  sourceSlice: 0,
+                  sourceLevel: 0,
+                  sourceOrigin: .init(x: 0, y: 0, z: 0),
+                  sourceSize: size,
+                  to: dst,
+                  destinationSlice: 0,
+                  destinationLevel: 0,
+                  destinationOrigin: .init(x: 0, y: 0, z: 0))
+        blit.endEncoding()
+        cmdBuf.commit()
+        cmdBuf.waitUntilCompleted() // ensure the pixel buffer is ready
+
+        return pb
+    }
+    
     init?(device: MTLDevice) {
         guard let q = device.makeCommandQueue() else { return nil }
         self.device = device
         queue = q
+        CVMetalTextureCacheCreate(kCFAllocatorDefault, nil, device, nil, &textureCache)
 
         // Pipeline (matches the shader names we discussed earlier)
         let lib = device.makeDefaultLibrary()!
@@ -128,9 +191,8 @@ final class WarpRenderer {
 
         // Area matching
         let rawArea = quadArea([tl, bl, br, tr])
-        let srcArea = centerOffset * centerOffset
+        let srcArea = 4 * centerOffset * centerOffset
         let s = 1.0/(sqrt(max(1e-8, srcArea / max(1e-8, rawArea))))
-
         // Pre-warp dest transform A (pixels)
         let A = T(offset.x, offset.y) * T(center.x, center.y) * S(s) * T(-center.x, -center.y)
 
@@ -141,7 +203,7 @@ final class WarpRenderer {
     }
 
     // MARK: - Public: call me each frame
-    func processFrame(srcTex: MTLTexture, H: simd_float3x3)->MTLTexture? {
+    func processFrame(srcTex: MTLTexture, H: simd_float3x3)->CVPixelBuffer? {
         let dstW = Int(srcTex.width)*CameraPreview.Coordinator.destinationTextureScaleFactor
         let dstH = Int(srcTex.height)*CameraPreview.Coordinator.destinationTextureScaleFactor
 
@@ -181,8 +243,8 @@ final class WarpRenderer {
 
         cmd.commit()
         cmd.waitUntilCompleted() // ensure the texture is ready to read
-
-        return dstTex
+        return pixelBufferFromTextureGPU(dstTex)
+        //return dstTex
     }
 }
 
@@ -381,226 +443,224 @@ struct RearWideCameraView: View {
         }
     }
 }
-
-final class PreviewMetalView: MTKView {
-    private let commandQueue: MTLCommandQueue
-    private var srcTexture: MTLTexture?
-    var clearTexture: MTLTexture?  // black texture sized to current drawable
-
-    /// Mimic CALayer.contentsGravity behavior
-    var contentsGravity: CALayerContentsGravity = .resizeAspectFill {
-        didSet { setNeedsDisplay() }
-    }
-
-    override init(frame: CGRect = .zero, device: MTLDevice? = MTLCreateSystemDefaultDevice()) {
-        let device = device ?? MTLCreateSystemDefaultDevice()!
-        self.commandQueue = device.makeCommandQueue()!
-        super.init(frame: frame, device: device)
-        isPaused = true
-        enableSetNeedsDisplay = true
-        framebufferOnly = false
-        isOpaque = true
-        colorPixelFormat = .bgra8Unorm
-        autoResizeDrawable = false
-    }
-
-    required init(coder: NSCoder) {
-        let device = MTLCreateSystemDefaultDevice()!
-        self.commandQueue = device.makeCommandQueue()!
-        super.init(coder: coder)
-        self.device = device
-        isPaused = true
-        enableSetNeedsDisplay = true
-        framebufferOnly = false
-        isOpaque = true
-        colorPixelFormat = .bgra8Unorm
-        autoResizeDrawable = false
-    }
-
-    // Keep drawableSize = view's pixel size to avoid CAMetalLayer stretching.
-    override func layoutSubviews() {
-        super.layoutSubviews()
-        drawableSize = CGSize(width: bounds.width * contentScaleFactor,
-                              height: bounds.height * contentScaleFactor)
-        clearTexture = nil // force re-make at new size
-    }
-
-    /// Public entry: just stash and trigger a draw
-    func draw(texture: MTLTexture) {
-        self.srcTexture = texture
-        setNeedsDisplay()
-    }
-
-    override func draw(_ rect: CGRect) {
-        guard let drawable = currentDrawable,
-              let src = srcTexture,
-              let cmd = commandQueue.makeCommandBuffer(),
-              let blit = cmd.makeBlitCommandEncoder() else { return }
-
-        // 1) Clear the drawable using a black texture via blit
-        ensureClearTexture(for: drawable.texture)
-        if let clearTex = clearTexture {
-            let full = MTLSize(width: drawable.texture.width, height: drawable.texture.height, depth: 1)
-            blit.copy(from: clearTex,
-                      sourceSlice: 0, sourceLevel: 0,
-                      sourceOrigin: .init(x: 0, y: 0, z: 0),
-                      sourceSize: full,
-                      to: drawable.texture,
-                      destinationSlice: 0, destinationLevel: 0,
-                      destinationOrigin: .init(x: 0, y: 0, z: 0))
-        }
-
-        // 2) Compute copy regions for aspect-fit/fill (no scaling)
-        let dstW = drawable.texture.width
-        let dstH = drawable.texture.height
-        let srcW = src.width
-        let srcH = src.height
-
-        let regions = computeCopyRegions(srcW: srcW, srcH: srcH, dstW: dstW, dstH: dstH, gravity: contentsGravity)
-
-        // 3) Blit the selected source region into the centered destination origin (same size)
-        if regions.size.width > 0 && regions.size.height > 0 {
-            blit.copy(from: src,
-                      sourceSlice: 0, sourceLevel: 0,
-                      sourceOrigin: regions.srcOrigin,
-                      sourceSize: regions.size,
-                      to: drawable.texture,
-                      destinationSlice: 0, destinationLevel: 0,
-                      destinationOrigin: regions.dstOrigin)
-        }
-
-        blit.endEncoding()
-        cmd.present(drawable)
-        cmd.commit()
-    }
-
-    // MARK: - Helpers
-
-    private func ensureClearTexture(for like: MTLTexture) {
-        guard clearTexture == nil ||
-              clearTexture!.width  != like.width ||
-              clearTexture!.height != like.height else { return }
-
-        let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: like.pixelFormat,
-                                                            width: like.width,
-                                                            height: like.height,
-                                                            mipmapped: false)
-        desc.usage = [.shaderRead, .shaderWrite] // generous; read/write not strictly needed
-        guard let tex = device?.makeTexture(descriptor: desc) else { return }
-
-        // Fill with zeros on CPU (bgra8Unorm -> black/opaque=0,0,0,0; if you prefer 1.0 alpha, still 0 here is fine for background)
-        let bytesPerPixel = 4
-        let rowBytes = like.width * bytesPerPixel
-        let zeroes = [UInt8](repeating: 0, count: rowBytes * like.height)
-        zeroes.withUnsafeBytes { ptr in
-            let region = MTLRegionMake2D(0, 0, like.width, like.height)
-            tex.replace(region: region, mipmapLevel: 0, withBytes: ptr.baseAddress!, bytesPerRow: rowBytes)
-        }
-        clearTexture = tex
-    }
-
-    private struct CopyRegions {
-        let srcOrigin: MTLOrigin
-        let dstOrigin: MTLOrigin
-        let size: MTLSize
-    }
-
-    /// Compute source crop (no scaling) and destination origin for aspect-fit/fill.
-    private func computeCopyRegions(srcW: Int, srcH: Int, dstW: Int, dstH: Int,
-                                    gravity: CALayerContentsGravity) -> CopyRegions
-    {
-        let srcAR = Double(srcW) / Double(srcH)
-        let dstAR = Double(dstW) / Double(dstH)
-
-        // Start with defaults
-        var copyW = min(srcW, dstW)
-        var copyH = min(srcH, dstH)
-        var srcX = 0
-        var srcY = 0
-        var dstX = (dstW - copyW) / 2
-        var dstY = (dstH - copyH) / 2
-
-        switch gravity {
-        case .resizeAspectFill:
-            // Fill the destination: choose a source crop with the destination's aspect ratio and (ideally) the destination size.
-            // If source is at least as large as destination in both axes, we can crop source to exactly dst size.
-            if srcW >= dstW && srcH >= dstH {
-                // Crop source to dst aspect, then take a dst-sized window from that crop.
-                // Compute maximal crop with dst aspect inside source.
-                // Option A: width-limited crop
-                var cropW = srcW
-                var cropH = Int((Double(cropW) / dstAR).rounded(.toNearestOrAwayFromZero))
-                if cropH > srcH {
-                    print("height is the limiter")
-
-                    // Height is the limiter
-                    cropH = srcH
-                    cropW = Int((Double(cropH) * dstAR).rounded(.toNearestOrAwayFromZero))
-                }
-                // Now from that crop, take a dst-sized window centered (no scaling)
-                // Because src >= dst in both axes, it's safe to take dst size directly.
-                copyW = dstW
-                copyH = dstH
-                srcX  = (srcW - copyW) / 2
-                srcY  = (srcH - copyH) / 2
-                dstX  = 0
-                dstY  = 0
-                print("copyW \(copyW) copyH \(copyH)")
-            } else {
-                // Source too small to truly fill without scaling; fall back to centered 1:1 copy.
-                // Keep aspect by limiting to the smaller limiting dimension relative to destination.
-                if dstAR > srcAR {
-                    // Destination wider: height-limited by src
-                    copyH = min(srcH, dstH)
-                    copyW = min(Int((Double(copyH) * srcAR).rounded(.toNearestOrAwayFromZero)), dstW)
-                } else {
-                    // Destination taller: width-limited by src
-                    copyW = min(srcW, dstW)
-                    copyH = min(Int((Double(copyW) / srcAR).rounded(.toNearestOrAwayFromZero)), dstH)
-                }
-                srcX = (srcW - copyW) / 2
-                srcY = (srcH - copyH) / 2
-                dstX = (dstW - copyW) / 2
-                dstY = (dstH - copyH) / 2
-            }
-
-        case .resizeAspect:
-            // Fit inside destination: choose a destination box with source aspect (no scaling), center it.
-            if dstAR > srcAR {
-                // Destination wider than source aspect -> height limits
-                copyH = min(srcH, dstH)
-                copyW = min(Int((Double(copyH) * srcAR).rounded(.toNearestOrAwayFromZero)), dstW)
-            } else {
-                // Destination taller (or equal) -> width limits
-                copyW = min(srcW, dstW)
-                copyH = min(Int((Double(copyW) / srcAR).rounded(.toNearestOrAwayFromZero)), dstH)
-            }
-            srcX = (srcW - copyW) / 2  // center-crop if source larger
-            srcY = (srcH - copyH) / 2
-            dstX = (dstW - copyW) / 2  // center in destination (letterbox/pillarbox)
-            dstY = (dstH - copyH) / 2
-
-        default:
-            // .resize (stretch) or others: copy the largest common sub-rect 1:1, centered.
-            copyW = min(srcW, dstW)
-            copyH = min(srcH, dstH)
-            srcX = (srcW - copyW) / 2
-            srcY = (srcH - copyH) / 2
-            dstX = (dstW - copyW) / 2
-            dstY = (dstH - copyH) / 2
-        }
-
-        // Clamp sanity
-        copyW = max(0, min(copyW, min(srcW, dstW)))
-        copyH = max(0, min(copyH, min(srcH, dstH)))
-
-        return CopyRegions(
-            srcOrigin: MTLOrigin(x: srcX, y: srcY, z: 0),
-            dstOrigin: MTLOrigin(x: dstX, y: dstY, z: 0),
-            size: MTLSize(width: copyW, height: copyH, depth: 1)
-        )
-    }
-}
+//
+//final class PreviewMetalView: MTKView {
+//    private let commandQueue: MTLCommandQueue
+//    private var srcTexture: MTLTexture?
+//    var clearTexture: MTLTexture?  // black texture sized to current drawable
+//
+//    /// Mimic CALayer.contentsGravity behavior
+//    var contentsGravity: CALayerContentsGravity = .resizeAspectFill {
+//        didSet { setNeedsDisplay() }
+//    }
+//
+//    override init(frame: CGRect = .zero, device: MTLDevice? = MTLCreateSystemDefaultDevice()) {
+//        let device = device ?? MTLCreateSystemDefaultDevice()!
+//        self.commandQueue = device.makeCommandQueue()!
+//        super.init(frame: frame, device: device)
+//        isPaused = true
+//        enableSetNeedsDisplay = true
+//        framebufferOnly = false
+//        isOpaque = true
+//        colorPixelFormat = .bgra8Unorm
+//        autoResizeDrawable = false
+//    }
+//
+//    required init(coder: NSCoder) {
+//        let device = MTLCreateSystemDefaultDevice()!
+//        self.commandQueue = device.makeCommandQueue()!
+//        super.init(coder: coder)
+//        self.device = device
+//        isPaused = true
+//        enableSetNeedsDisplay = true
+//        framebufferOnly = false
+//        isOpaque = true
+//        colorPixelFormat = .bgra8Unorm
+//        autoResizeDrawable = false
+//    }
+//
+//    // Keep drawableSize = view's pixel size to avoid CAMetalLayer stretching.
+//    override func layoutSubviews() {
+//        super.layoutSubviews()
+//        drawableSize = CGSize(width: bounds.width * contentScaleFactor,
+//                              height: bounds.height * contentScaleFactor)
+//        clearTexture = nil // force re-make at new size
+//    }
+//
+//    /// Public entry: just stash and trigger a draw
+//    func draw(texture: MTLTexture) {
+//        self.srcTexture = texture
+//        setNeedsDisplay()
+//    }
+//
+//    override func draw(_ rect: CGRect) {
+//        guard let drawable = currentDrawable,
+//              let src = srcTexture,
+//              let cmd = commandQueue.makeCommandBuffer(),
+//              let blit = cmd.makeBlitCommandEncoder() else { return }
+//
+//        // 1) Clear the drawable using a black texture via blit
+//        ensureClearTexture(for: drawable.texture)
+//        if let clearTex = clearTexture {
+//            let full = MTLSize(width: drawable.texture.width, height: drawable.texture.height, depth: 1)
+//            blit.copy(from: clearTex,
+//                      sourceSlice: 0, sourceLevel: 0,
+//                      sourceOrigin: .init(x: 0, y: 0, z: 0),
+//                      sourceSize: full,
+//                      to: drawable.texture,
+//                      destinationSlice: 0, destinationLevel: 0,
+//                      destinationOrigin: .init(x: 0, y: 0, z: 0))
+//        }
+//
+//        // 2) Compute copy regions for aspect-fit/fill (no scaling)
+//        let dstW = drawable.texture.width
+//        let dstH = drawable.texture.height
+//        let srcW = src.width
+//        let srcH = src.height
+//
+//        let regions = computeCopyRegions(srcW: srcW, srcH: srcH, dstW: dstW, dstH: dstH, gravity: contentsGravity)
+//
+//        // 3) Blit the selected source region into the centered destination origin (same size)
+//        if regions.size.width > 0 && regions.size.height > 0 {
+//            blit.copy(from: src,
+//                      sourceSlice: 0, sourceLevel: 0,
+//                      sourceOrigin: regions.srcOrigin,
+//                      sourceSize: regions.size,
+//                      to: drawable.texture,
+//                      destinationSlice: 0, destinationLevel: 0,
+//                      destinationOrigin: regions.dstOrigin)
+//        }
+//
+//        blit.endEncoding()
+//        cmd.present(drawable)
+//        cmd.commit()
+//    }
+//
+//    // MARK: - Helpers
+//
+//    private func ensureClearTexture(for like: MTLTexture) {
+//        guard clearTexture == nil ||
+//              clearTexture!.width  != like.width ||
+//              clearTexture!.height != like.height else { return }
+//
+//        let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: like.pixelFormat,
+//                                                            width: like.width,
+//                                                            height: like.height,
+//                                                            mipmapped: false)
+//        desc.usage = [.shaderRead, .shaderWrite] // generous; read/write not strictly needed
+//        guard let tex = device?.makeTexture(descriptor: desc) else { return }
+//
+//        // Fill with zeros on CPU (bgra8Unorm -> black/opaque=0,0,0,0; if you prefer 1.0 alpha, still 0 here is fine for background)
+//        let bytesPerPixel = 4
+//        let rowBytes = like.width * bytesPerPixel
+//        let zeroes = [UInt8](repeating: 0, count: rowBytes * like.height)
+//        zeroes.withUnsafeBytes { ptr in
+//            let region = MTLRegionMake2D(0, 0, like.width, like.height)
+//            tex.replace(region: region, mipmapLevel: 0, withBytes: ptr.baseAddress!, bytesPerRow: rowBytes)
+//        }
+//        clearTexture = tex
+//    }
+//
+//    private struct CopyRegions {
+//        let srcOrigin: MTLOrigin
+//        let dstOrigin: MTLOrigin
+//        let size: MTLSize
+//    }
+//
+//    /// Compute source crop (no scaling) and destination origin for aspect-fit/fill.
+//    private func computeCopyRegions(srcW: Int, srcH: Int, dstW: Int, dstH: Int,
+//                                    gravity: CALayerContentsGravity) -> CopyRegions
+//    {
+//        let srcAR = Double(srcW) / Double(srcH)
+//        let dstAR = Double(dstW) / Double(dstH)
+//
+//        // Start with defaults
+//        var copyW = min(srcW, dstW)
+//        var copyH = min(srcH, dstH)
+//        var srcX = 0
+//        var srcY = 0
+//        var dstX = (dstW - copyW) / 2
+//        var dstY = (dstH - copyH) / 2
+//
+//        switch gravity {
+//        case .resizeAspectFill:
+//            // Fill the destination: choose a source crop with the destination's aspect ratio and (ideally) the destination size.
+//            // If source is at least as large as destination in both axes, we can crop source to exactly dst size.
+//            if srcW >= dstW && srcH >= dstH {
+//                // Crop source to dst aspect, then take a dst-sized window from that crop.
+//                // Compute maximal crop with dst aspect inside source.
+//                // Option A: width-limited crop
+//                var cropW = srcW
+//                var cropH = Int((Double(cropW) / dstAR).rounded(.toNearestOrAwayFromZero))
+//                if cropH > srcH {
+//                    // Height is the limiter
+//                    cropH = srcH
+//                    cropW = Int((Double(cropH) * dstAR).rounded(.toNearestOrAwayFromZero))
+//                }
+//                // Now from that crop, take a dst-sized window centered (no scaling)
+//                // Because src >= dst in both axes, it's safe to take dst size directly.
+//                copyW = dstW
+//                copyH = dstH
+//                srcX  = (srcW - copyW) / 2
+//                srcY  = (srcH - copyH) / 2
+//                dstX  = 0
+//                dstY  = 0
+//                print("copyW \(copyW) copyH \(copyH)")
+//            } else {
+//                // Source too small to truly fill without scaling; fall back to centered 1:1 copy.
+//                // Keep aspect by limiting to the smaller limiting dimension relative to destination.
+//                if dstAR > srcAR {
+//                    // Destination wider: height-limited by src
+//                    copyH = min(srcH, dstH)
+//                    copyW = min(Int((Double(copyH) * srcAR).rounded(.toNearestOrAwayFromZero)), dstW)
+//                } else {
+//                    // Destination taller: width-limited by src
+//                    copyW = min(srcW, dstW)
+//                    copyH = min(Int((Double(copyW) / srcAR).rounded(.toNearestOrAwayFromZero)), dstH)
+//                }
+//                srcX = (srcW - copyW) / 2
+//                srcY = (srcH - copyH) / 2
+//                dstX = (dstW - copyW) / 2
+//                dstY = (dstH - copyH) / 2
+//            }
+//
+//        case .resizeAspect:
+//            // Fit inside destination: choose a destination box with source aspect (no scaling), center it.
+//            if dstAR > srcAR {
+//                // Destination wider than source aspect -> height limits
+//                copyH = min(srcH, dstH)
+//                copyW = min(Int((Double(copyH) * srcAR).rounded(.toNearestOrAwayFromZero)), dstW)
+//            } else {
+//                // Destination taller (or equal) -> width limits
+//                copyW = min(srcW, dstW)
+//                copyH = min(Int((Double(copyW) / srcAR).rounded(.toNearestOrAwayFromZero)), dstH)
+//            }
+//            srcX = (srcW - copyW) / 2  // center-crop if source larger
+//            srcY = (srcH - copyH) / 2
+//            dstX = (dstW - copyW) / 2  // center in destination (letterbox/pillarbox)
+//            dstY = (dstH - copyH) / 2
+//
+//        default:
+//            // .resize (stretch) or others: copy the largest common sub-rect 1:1, centered.
+//            copyW = min(srcW, dstW)
+//            copyH = min(srcH, dstH)
+//            srcX = (srcW - copyW) / 2
+//            srcY = (srcH - copyH) / 2
+//            dstX = (dstW - copyW) / 2
+//            dstY = (dstH - copyH) / 2
+//        }
+//
+//        // Clamp sanity
+//        copyW = max(0, min(copyW, min(srcW, dstW)))
+//        copyH = max(0, min(copyH, min(srcH, dstH)))
+//
+//        return CopyRegions(
+//            srcOrigin: MTLOrigin(x: srcX, y: srcY, z: 0),
+//            dstOrigin: MTLOrigin(x: dstX, y: dstY, z: 0),
+//            size: MTLSize(width: copyW, height: copyH, depth: 1)
+//        )
+//    }
+//}
 
 struct CameraPreview: UIViewRepresentable {
     let session: AVCaptureSession
@@ -629,9 +689,11 @@ struct CameraPreview: UIViewRepresentable {
         container.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         scroll.addSubview(container)
         // Live preview
-        let preview = PreviewMetalView()
+        let preview = PreviewMetalView(frame: .zero, device: MTLCreateSystemDefaultDevice()!)
         preview.frame = container.bounds
+        print("container.boudns \(preview.frame)")
         preview.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        preview.contentMode = .scaleAspectFill
         container.addSubview(preview)
         // Frozen overlay (hidden by default)
         let overlay = UIImageView(frame: container.bounds)
@@ -761,7 +823,7 @@ struct CameraPreview: UIViewRepresentable {
             }
         }
         
-        func applyHomographyToImage(texture: MTLTexture, H: simd_float3x3)->MTLTexture? {
+        func applyHomographyToImage(texture: MTLTexture, H: simd_float3x3)->CVPixelBuffer? {
             if renderer == nil {
                 renderer = WarpRenderer(device: device)
             }
@@ -790,7 +852,7 @@ struct CameraPreview: UIViewRepresentable {
         /// - Parameters:
         ///   - uiImage: the texture that wraps the pixel buffer from the camera feed
         /// - Returns: the corrected texture (nil otherwise)
-        func rectifyToLevel(_ texture: MTLTexture) -> MTLTexture? {
+        func rectifyToLevel(_ texture: MTLTexture) -> CVPixelBuffer? {
             guard let gravity = gravity else {
                 return nil
             }
@@ -870,7 +932,9 @@ struct CameraPreview: UIViewRepresentable {
                 self.updateIntrinsicsIfNeeded(from: pb)
                 if let texture = mtlBridge.makeTexture(from: pb), let leveled = self.rectifyToLevel(texture) {
                     DispatchQueue.main.async {
-                        self.preview?.draw(texture: leveled)
+                        
+                        self.preview?.pixelBuffer = leveled
+                        //self.preview?.draw(texture: leveled)
                         if self.prepareToFreeze, let displayedTexture = self.preview?.currentDrawable?.texture {
                             // this pipeline is very slow, so only do it when we are about to freeze
                             let leveledCI = CIImage(
@@ -889,6 +953,11 @@ struct CameraPreview: UIViewRepresentable {
                     }
                 }
                 print("total frame processing time \(Date().timeIntervalSince(frameStart))")
+                DispatchQueue.main.async {
+                    print("container bounds", container?.bounds)
+                    print("overlay bounds", overlay?.bounds)
+                    print("preview bounds", preview?.bounds)
+                }
                 self.processingFrame = false
             }
         }
@@ -1142,6 +1211,8 @@ struct CameraAlert: Identifiable {
     let title: String
     let message: String
 }
+
+
 
 final class PixelBufferMetalBridge {
     private let device = MTLCreateSystemDefaultDevice()!
