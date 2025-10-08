@@ -128,7 +128,7 @@ final class WarpRenderer {
 
         // Area matching
         let rawArea = quadArea([tl, bl, br, tr])
-        let srcArea = centerOffset * centerOffset
+        let srcArea = centerOffset * centerOffset * 4
         let s = 1.0/(sqrt(max(1e-8, srcArea / max(1e-8, rawArea))))
 
         // Pre-warp dest transform A (pixels)
@@ -384,10 +384,10 @@ struct RearWideCameraView: View {
 
 final class PreviewMetalView: MTKView {
     private let commandQueue: MTLCommandQueue
+    private var pipeline: MTLRenderPipelineState!
+    private var sampler: MTLSamplerState!
     private var srcTexture: MTLTexture?
-    var clearTexture: MTLTexture?  // black texture sized to current drawable
 
-    /// Mimic CALayer.contentsGravity behavior
     var contentsGravity: CALayerContentsGravity = .resizeAspectFill {
         didSet { setNeedsDisplay() }
     }
@@ -399,9 +399,23 @@ final class PreviewMetalView: MTKView {
         isPaused = true
         enableSetNeedsDisplay = true
         framebufferOnly = false
-        isOpaque = true
         colorPixelFormat = .bgra8Unorm
-        autoResizeDrawable = false
+        isOpaque = true
+
+        // Build pipeline once
+        let lib = try! device.makeDefaultLibrary()!
+        let desc = MTLRenderPipelineDescriptor()
+        desc.vertexFunction   = lib.makeFunction(name: "vs_fullscreen")
+        desc.fragmentFunction = lib.makeFunction(name: "fs_sample")
+        desc.colorAttachments[0].pixelFormat = colorPixelFormat
+        pipeline = try! device.makeRenderPipelineState(descriptor: desc)
+
+        let sampDesc = MTLSamplerDescriptor()
+        sampDesc.minFilter = .linear
+        sampDesc.magFilter = .linear
+        sampDesc.sAddressMode = .clampToEdge
+        sampDesc.tAddressMode = .clampToEdge
+        sampler = device.makeSamplerState(descriptor: sampDesc)
     }
 
     required init(coder: NSCoder) {
@@ -409,196 +423,87 @@ final class PreviewMetalView: MTKView {
         self.commandQueue = device.makeCommandQueue()!
         super.init(coder: coder)
         self.device = device
-        isPaused = true
-        enableSetNeedsDisplay = true
-        framebufferOnly = false
-        isOpaque = true
-        colorPixelFormat = .bgra8Unorm
-        autoResizeDrawable = false
     }
 
-    // Keep drawableSize = view's pixel size to avoid CAMetalLayer stretching.
+    // Keep drawableSize in sync with view pixels (prevents CAMetalLayer stretching)
     override func layoutSubviews() {
         super.layoutSubviews()
-        drawableSize = CGSize(width: bounds.width * contentScaleFactor,
+        drawableSize = CGSize(width: bounds.width  * contentScaleFactor,
                               height: bounds.height * contentScaleFactor)
-        clearTexture = nil // force re-make at new size
     }
 
-    /// Public entry: just stash and trigger a draw
-    func draw(texture: MTLTexture) {
-        self.srcTexture = texture
+    func draw(texture: MTLTexture, flipY: Bool = false, rotateRight: Bool = true) {
+        srcTexture = texture
         setNeedsDisplay()
     }
 
     override func draw(_ rect: CGRect) {
         guard let drawable = currentDrawable,
-              let src = srcTexture,
-              let cmd = commandQueue.makeCommandBuffer(),
-              let blit = cmd.makeBlitCommandEncoder() else { return }
+              let texture = srcTexture,
+              let rpd = currentRenderPassDescriptor else { return }
 
-        // 1) Clear the drawable using a black texture via blit
-        ensureClearTexture(for: drawable.texture)
-        if let clearTex = clearTexture {
-            let full = MTLSize(width: drawable.texture.width, height: drawable.texture.height, depth: 1)
-            blit.copy(from: clearTex,
-                      sourceSlice: 0, sourceLevel: 0,
-                      sourceOrigin: .init(x: 0, y: 0, z: 0),
-                      sourceSize: full,
-                      to: drawable.texture,
-                      destinationSlice: 0, destinationLevel: 0,
-                      destinationOrigin: .init(x: 0, y: 0, z: 0))
+        // Clear to black so letterbox bars look clean
+        rpd.colorAttachments[0].loadAction = .clear
+        rpd.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1)
+
+        let cmd = commandQueue.makeCommandBuffer()!
+        let enc = cmd.makeRenderCommandEncoder(descriptor: rpd)!
+        enc.setRenderPipelineState(pipeline)
+        enc.setFragmentTexture(texture, index: 0)
+        enc.setFragmentSamplerState(sampler, index: 0)
+
+        // Compute aspect transform
+        let dw = Float(drawableSize.width)
+        let dh = Float(drawableSize.height)
+        let tw = Float(texture.width)
+        let th = Float(texture.height)
+
+        let viewAR = dw / dh
+        let texAR  = tw / th
+
+        // For resizeAspect: scale the larger dimension so smaller fits
+        // For resizeAspectFill: scale the smaller dimension so larger fills
+        let isAspectFill = (contentsGravity == .resizeAspectFill)
+        var scaleX: Float = 1, scaleY: Float = 1
+
+        if isAspectFill {
+            // Fill: one axis > 1.0 so UVs bleed outside and get clipped -> crop
+            if texAR > viewAR {
+                // texture wider than view -> scale X up
+                scaleX = viewAR / texAR
+            } else {
+                // texture taller -> scale Y up
+                scaleY = texAR / viewAR
+            }
+        } else if contentsGravity == .resizeAspect {
+            // Fit: one axis < 1.0 so we get letterboxing/pillarboxing
+            if texAR > viewAR {
+                // texture wider -> shrink Y
+                scaleY = texAR / viewAR
+            } else {
+                // texture taller -> shrink X
+                scaleX = viewAR / texAR
+            }
+        } else {
+            // .resize (stretch): leave (1,1) to fill and distort
         }
+        // Flips/orientation
+        // Flip Y to convert camera coordinates to UIKit-style if needed.
+        let flipUVx: Float = 1
+        let flipUVy: Float = /* flip vertically? */ -1 // set to 1 if not flipping
 
-        // 2) Compute copy regions for aspect-fit/fill (no scaling)
-        let dstW = drawable.texture.width
-        let dstH = drawable.texture.height
-        let srcW = src.width
-        let srcH = src.height
+        struct Uniforms { var scaleUV: SIMD2<Float>; var offsetUV: SIMD2<Float>; var flipUV: SIMD2<Float> }
+        let U = Uniforms(scaleUV: SIMD2<Float>(scaleX, scaleY),
+                         offsetUV: SIMD2<Float>(0, 0),
+                         flipUV: SIMD2<Float>(flipUVx, flipUVy))
 
-        let regions = computeCopyRegions(srcW: srcW, srcH: srcH, dstW: dstW, dstH: dstH, gravity: contentsGravity)
+        enc.setVertexBytes([U], length: MemoryLayout<Uniforms>.stride, index: 0)
 
-        // 3) Blit the selected source region into the centered destination origin (same size)
-        if regions.size.width > 0 && regions.size.height > 0 {
-            blit.copy(from: src,
-                      sourceSlice: 0, sourceLevel: 0,
-                      sourceOrigin: regions.srcOrigin,
-                      sourceSize: regions.size,
-                      to: drawable.texture,
-                      destinationSlice: 0, destinationLevel: 0,
-                      destinationOrigin: regions.dstOrigin)
-        }
-
-        blit.endEncoding()
+        // Draw the fullscreen triangle
+        enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+        enc.endEncoding()
         cmd.present(drawable)
         cmd.commit()
-    }
-
-    // MARK: - Helpers
-
-    private func ensureClearTexture(for like: MTLTexture) {
-        guard clearTexture == nil ||
-              clearTexture!.width  != like.width ||
-              clearTexture!.height != like.height else { return }
-
-        let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: like.pixelFormat,
-                                                            width: like.width,
-                                                            height: like.height,
-                                                            mipmapped: false)
-        desc.usage = [.shaderRead, .shaderWrite] // generous; read/write not strictly needed
-        guard let tex = device?.makeTexture(descriptor: desc) else { return }
-
-        // Fill with zeros on CPU (bgra8Unorm -> black/opaque=0,0,0,0; if you prefer 1.0 alpha, still 0 here is fine for background)
-        let bytesPerPixel = 4
-        let rowBytes = like.width * bytesPerPixel
-        let zeroes = [UInt8](repeating: 0, count: rowBytes * like.height)
-        zeroes.withUnsafeBytes { ptr in
-            let region = MTLRegionMake2D(0, 0, like.width, like.height)
-            tex.replace(region: region, mipmapLevel: 0, withBytes: ptr.baseAddress!, bytesPerRow: rowBytes)
-        }
-        clearTexture = tex
-    }
-
-    private struct CopyRegions {
-        let srcOrigin: MTLOrigin
-        let dstOrigin: MTLOrigin
-        let size: MTLSize
-    }
-
-    /// Compute source crop (no scaling) and destination origin for aspect-fit/fill.
-    private func computeCopyRegions(srcW: Int, srcH: Int, dstW: Int, dstH: Int,
-                                    gravity: CALayerContentsGravity) -> CopyRegions
-    {
-        let srcAR = Double(srcW) / Double(srcH)
-        let dstAR = Double(dstW) / Double(dstH)
-
-        // Start with defaults
-        var copyW = min(srcW, dstW)
-        var copyH = min(srcH, dstH)
-        var srcX = 0
-        var srcY = 0
-        var dstX = (dstW - copyW) / 2
-        var dstY = (dstH - copyH) / 2
-
-        switch gravity {
-        case .resizeAspectFill:
-            // Fill the destination: choose a source crop with the destination's aspect ratio and (ideally) the destination size.
-            // If source is at least as large as destination in both axes, we can crop source to exactly dst size.
-            if srcW >= dstW && srcH >= dstH {
-                // Crop source to dst aspect, then take a dst-sized window from that crop.
-                // Compute maximal crop with dst aspect inside source.
-                // Option A: width-limited crop
-                var cropW = srcW
-                var cropH = Int((Double(cropW) / dstAR).rounded(.toNearestOrAwayFromZero))
-                if cropH > srcH {
-                    print("height is the limiter")
-
-                    // Height is the limiter
-                    cropH = srcH
-                    cropW = Int((Double(cropH) * dstAR).rounded(.toNearestOrAwayFromZero))
-                }
-                // Now from that crop, take a dst-sized window centered (no scaling)
-                // Because src >= dst in both axes, it's safe to take dst size directly.
-                copyW = dstW
-                copyH = dstH
-                srcX  = (srcW - copyW) / 2
-                srcY  = (srcH - copyH) / 2
-                dstX  = 0
-                dstY  = 0
-                print("copyW \(copyW) copyH \(copyH)")
-            } else {
-                // Source too small to truly fill without scaling; fall back to centered 1:1 copy.
-                // Keep aspect by limiting to the smaller limiting dimension relative to destination.
-                if dstAR > srcAR {
-                    // Destination wider: height-limited by src
-                    copyH = min(srcH, dstH)
-                    copyW = min(Int((Double(copyH) * srcAR).rounded(.toNearestOrAwayFromZero)), dstW)
-                } else {
-                    // Destination taller: width-limited by src
-                    copyW = min(srcW, dstW)
-                    copyH = min(Int((Double(copyW) / srcAR).rounded(.toNearestOrAwayFromZero)), dstH)
-                }
-                srcX = (srcW - copyW) / 2
-                srcY = (srcH - copyH) / 2
-                dstX = (dstW - copyW) / 2
-                dstY = (dstH - copyH) / 2
-            }
-
-        case .resizeAspect:
-            // Fit inside destination: choose a destination box with source aspect (no scaling), center it.
-            if dstAR > srcAR {
-                // Destination wider than source aspect -> height limits
-                copyH = min(srcH, dstH)
-                copyW = min(Int((Double(copyH) * srcAR).rounded(.toNearestOrAwayFromZero)), dstW)
-            } else {
-                // Destination taller (or equal) -> width limits
-                copyW = min(srcW, dstW)
-                copyH = min(Int((Double(copyW) / srcAR).rounded(.toNearestOrAwayFromZero)), dstH)
-            }
-            srcX = (srcW - copyW) / 2  // center-crop if source larger
-            srcY = (srcH - copyH) / 2
-            dstX = (dstW - copyW) / 2  // center in destination (letterbox/pillarbox)
-            dstY = (dstH - copyH) / 2
-
-        default:
-            // .resize (stretch) or others: copy the largest common sub-rect 1:1, centered.
-            copyW = min(srcW, dstW)
-            copyH = min(srcH, dstH)
-            srcX = (srcW - copyW) / 2
-            srcY = (srcH - copyH) / 2
-            dstX = (dstW - copyW) / 2
-            dstY = (dstH - copyH) / 2
-        }
-
-        // Clamp sanity
-        copyW = max(0, min(copyW, min(srcW, dstW)))
-        copyH = max(0, min(copyH, min(srcH, dstH)))
-
-        return CopyRegions(
-            srcOrigin: MTLOrigin(x: srcX, y: srcY, z: 0),
-            dstOrigin: MTLOrigin(x: dstX, y: dstY, z: 0),
-            size: MTLSize(width: copyW, height: copyH, depth: 1)
-        )
     }
 }
 
