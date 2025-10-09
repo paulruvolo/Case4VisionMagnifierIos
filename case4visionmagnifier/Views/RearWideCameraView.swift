@@ -435,14 +435,14 @@ final class PreviewMetalView: MTKView {
 
     func draw(texture: MTLTexture, flipY: Bool = false, rotateRight: Bool = true) {
         srcTexture = texture
+        // we don't require the drawable to be the exact size since due to rounding logic that we don't control, sometimes the size of the drawable texture will be off by a pixel or two compared to whwat we set it to here.
         if let drawable = currentDrawable, abs(drawable.texture.width - texture.width) > 5 && abs(drawable.texture.height - texture.height) > 5 {
             let viewAR = bounds.width / bounds.height
             let texAR = CGFloat(texture.width) / CGFloat(texture.height)
-            // Note: the +1's seem to be needed due to rounding logic
             if texAR > viewAR {
-                drawableSize = CGSize(width: Int(CGFloat(texture.height+1) * viewAR), height: texture.height+1)
+                drawableSize = CGSize(width: Int(round(CGFloat(texture.height) * viewAR)), height: texture.height)
             } else {
-                drawableSize = CGSize(width: texture.width+1, height: Int(CGFloat(texture.width+1) / viewAR))
+                drawableSize = CGSize(width: texture.width, height: Int(round(CGFloat(texture.width) / viewAR)))
             }
             print("set needs layout \(drawable.texture.width) \(drawable.texture.height) \(texture.width) \(texture.height)")
             setNeedsLayout()
