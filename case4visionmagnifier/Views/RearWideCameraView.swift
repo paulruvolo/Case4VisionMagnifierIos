@@ -428,12 +428,25 @@ final class PreviewMetalView: MTKView {
     // Keep drawableSize in sync with view pixels (prevents CAMetalLayer stretching)
     override func layoutSubviews() {
         super.layoutSubviews()
-        drawableSize = CGSize(width: bounds.width  * contentScaleFactor,
-                              height: bounds.height * contentScaleFactor)
+        // let drawable size be based on textures we are rendering
+        //        drawableSize = CGSize(width: bounds.width  * contentScaleFactor,
+//                              height: bounds.height * contentScaleFactor)
     }
 
     func draw(texture: MTLTexture, flipY: Bool = false, rotateRight: Bool = true) {
         srcTexture = texture
+        if let drawable = currentDrawable, abs(drawable.texture.width - texture.width) > 5 && abs(drawable.texture.height - texture.height) > 5 {
+            let viewAR = bounds.width / bounds.height
+            let texAR = CGFloat(texture.width) / CGFloat(texture.height)
+            // Note: the +1's seem to be needed due to rounding logic
+            if texAR > viewAR {
+                drawableSize = CGSize(width: Int(CGFloat(texture.height+1) * viewAR), height: texture.height+1)
+            } else {
+                drawableSize = CGSize(width: texture.width+1, height: Int(CGFloat(texture.width+1) / viewAR))
+            }
+            print("set needs layout \(drawable.texture.width) \(drawable.texture.height) \(texture.width) \(texture.height)")
+            setNeedsLayout()
+        }
         setNeedsDisplay()
     }
 
@@ -793,7 +806,6 @@ struct CameraPreview: UIViewRepresentable {
                         }
                     }
                 }
-                print("total frame processing time \(Date().timeIntervalSince(frameStart))")
                 self.processingFrame = false
             }
         }
