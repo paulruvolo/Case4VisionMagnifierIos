@@ -249,6 +249,20 @@ struct RearWideCameraView: View {
                 VStack {
                     HStack {
                         Button(action: {
+                            includeGuides.toggle()
+                        }) {
+                            Image(systemName: "equal.circle")
+                                .font(.system(size: Self.sfSymbolSize))
+                                .foregroundColor(buttonFGColor)
+                        }
+                        .accessibilityLabel("Reading guidelines")
+                        .accessibilityValue(includeGuides ? "guidelines on" : "guidelines off")
+                        .padding(5)
+                        .background(
+                            Circle().fill(buttonBGColor) // solid circular background
+                        )
+                        Spacer()
+                        Button(action: {
                             isFrozen.toggle()
                         }) {
                             if isFrozen {
@@ -261,27 +275,8 @@ struct RearWideCameraView: View {
                                     .foregroundColor(buttonFGColor)
                             }
                         }
-                        .padding(5)
-                        .background(
-                            Circle().fill(buttonBGColor) // solid circular background
-                        )
-                        Spacer()
-                        Button(action: {
-                            switch filterMode {
-                            case .none:
-                                filterMode = .blackOnWhite
-                            case .blackOnWhite:
-                                filterMode = .whiteOnBlack
-                            case .whiteOnBlack:
-                                filterMode = .yellowOnBlack
-                            case .yellowOnBlack:
-                                filterMode = .none
-                            }
-                        }) {
-                            Image(systemName: "camera.filters")
-                                .font(.system(size: Self.sfSymbolSize))
-                                .foregroundColor(buttonFGColor)
-                        }
+                        .accessibilityLabel("Freeze image")
+                        .accessibilityValue(isFrozen ? "image frozen" : "image unfrozen")
                         .padding(5)
                         .background(
                             Circle().fill(buttonBGColor) // solid circular background
@@ -302,7 +297,31 @@ struct RearWideCameraView: View {
                             .frame(height: 10)
                             .ignoresSafeArea()
                     }
+                    
                     HStack {
+                        Button(action: {
+                            switch filterMode {
+                            case .none:
+                                filterMode = .blackOnWhite
+                            case .blackOnWhite:
+                                filterMode = .whiteOnBlack
+                            case .whiteOnBlack:
+                                filterMode = .yellowOnBlack
+                            case .yellowOnBlack:
+                                filterMode = .none
+                            }
+                        }) {
+                            Image(systemName: "camera.filters")
+                                .font(.system(size: Self.sfSymbolSize))
+                                .foregroundColor(buttonFGColor)
+                        }
+                        .accessibilityLabel("Color filtering")
+                        .accessibilityValue(filterMode.rawValue)
+                        .padding(5)
+                        .background(
+                            Circle().fill(buttonBGColor) // solid circular background
+                        )
+                        Spacer()
                         Button(action: {
                             guard let videoInput = session.inputs
                                 .compactMap({ $0 as? AVCaptureDeviceInput })
@@ -341,18 +360,8 @@ struct RearWideCameraView: View {
                                     .foregroundColor(buttonFGColor)
                             }
                         }
-                        .padding(5)
-                        .background(
-                            Circle().fill(buttonBGColor) // solid circular background
-                        )
-                        Spacer()
-                        Button(action: {
-                            includeGuides.toggle()
-                        }) {
-                            Image(systemName: "equal.circle")
-                                .font(.system(size: Self.sfSymbolSize))
-                                .foregroundColor(buttonFGColor)
-                        }
+                        .accessibilityLabel("Flashlight")
+                        .accessibilityValue(torch.isOn ? "flashlight on" : "flashlight off")
                         .padding(5)
                         .background(
                             Circle().fill(buttonBGColor) // solid circular background
@@ -768,7 +777,6 @@ struct CameraPreview: UIViewRepresentable {
         
         func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer:
                         CMSampleBuffer, from connection: AVCaptureConnection) {
-            let frameStart = Date()
             // We are careful not to process frames too slowly, so we discard frames if we are still processing a previous frame
             guard !processingFrame else {
                 return
@@ -949,7 +957,11 @@ final class CameraModel: ObservableObject {
         // Apple device types:
         // - .builtInWideAngleCamera → the standard "Wide" camera (≈ 26mm equiv)
         // - .builtInUltraWideCamera → the Ultra Wide (≈ 13mm) — we intentionally avoid this
-        let discovery = AVCaptureDevice.DiscoverySession( deviceTypes: [.builtInUltraWideCamera], mediaType: .video, position: .back )
+        var discovery = AVCaptureDevice.DiscoverySession( deviceTypes: [.builtInUltraWideCamera], mediaType: .video, position: .back )
+        if discovery.devices.isEmpty {
+            // use wide angle instead
+            discovery = AVCaptureDevice.DiscoverySession( deviceTypes: [.builtInWideAngleCamera], mediaType: .video, position: .back )
+        }
         guard let device = discovery.devices.first else {
             throw CameraError.noRearWideCamera
         }
@@ -1047,7 +1059,7 @@ private enum CameraError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .noRearWideCamera:
-            return "No rear wide-angle camera was found on this device."
+            return "No rear ultra wide or wide-angle camera was found on this device."
         case .cannotAddInput:
             return "Failed to add camera input to the capture session."
         }
