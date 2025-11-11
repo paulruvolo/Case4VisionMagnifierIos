@@ -207,6 +207,8 @@ struct RearWideCameraView: View {
     @Environment(\.scenePhase) private var scenePhase
     
     private static let sfSymbolSize: CGFloat = 60
+    // this is needed to prevent the guidelines from moving when frozen
+    private static let snowFlakeSlashSize: CGFloat = 54
     
     private var buttonFGColor: Color {
         switch filterMode {
@@ -267,7 +269,7 @@ struct RearWideCameraView: View {
                         }) {
                             if isFrozen {
                                 Image(systemName: "snowflake.slash")
-                                    .font(.system(size: Self.sfSymbolSize))
+                                    .font(.system(size: Self.snowFlakeSlashSize)) // hack due to large icon size
                                     .foregroundColor(buttonFGColor)
                             } else {
                                 Image(systemName: "snowflake")
@@ -368,7 +370,10 @@ struct RearWideCameraView: View {
                         )
                     }
                 }
-                .padding([.top], 15) // space from edges
+                .padding([.top, .bottom], 20)
+                .padding([.horizontal], 20)
+                .ignoresSafeArea()
+
                
             } else {
                 VStack(spacing: 12) {
