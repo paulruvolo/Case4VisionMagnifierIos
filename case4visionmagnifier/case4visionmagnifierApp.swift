@@ -7,6 +7,8 @@
 
 import SwiftUI
 import UIKit
+import FirebaseCore
+
 
 // 1) App delegate exposes a mutable orientation lock
 class AppDelegate: NSObject, UIApplicationDelegate {
@@ -17,6 +19,12 @@ class AppDelegate: NSObject, UIApplicationDelegate {
         -> UIInterfaceOrientationMask
     {
         Self.orientationLock
+    }
+    func application(_ application: UIApplication,
+                     didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey : Any]? = nil) -> Bool {
+      FirebaseApp.configure()
+
+      return true
     }
 }
 

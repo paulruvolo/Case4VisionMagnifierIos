@@ -540,7 +540,6 @@ struct CameraPreview: UIViewRepresentable {
     @Binding var filterMode: FilterMode
     @Binding var minimumMagnification: Double
 
-    var minZoom: CGFloat = 1.0
     var maxZoom: CGFloat = 10.0
     
     func makeCoordinator() -> Coordinator {
@@ -548,8 +547,14 @@ struct CameraPreview: UIViewRepresentable {
     }
     func makeUIView(context: Context) -> UIScrollView {
         let scroll = UIScrollView()
-        scroll.minimumZoomScale = minZoom
+        scroll.minimumZoomScale = minimumMagnification
         scroll.maximumZoomScale = maxZoom
+        DispatchQueue.main.async {
+            scroll.setZoomScale(minimumMagnification, animated: false)
+            // Center after layout
+            context.coordinator.centerContent()
+            context.coordinator.lockContentOffsetToCenter()
+        }
         scroll.bouncesZoom = true
         scroll.showsVerticalScrollIndicator = false
         scroll.showsHorizontalScrollIndicator = false
@@ -647,7 +652,17 @@ struct CameraPreview: UIViewRepresentable {
         }
         
         func applyMinimumMagnification(_ minimumMag: Double) {
-            scrollView?.minimumZoomScale = minimumMag
+            guard let scrollView else {
+                return
+            }
+            scrollView.minimumZoomScale = minimumMag
+            if scrollView.zoomScale < minimumMag {
+                DispatchQueue.main.async {
+                    scrollView.setZoomScale(minimumMag, animated: false)
+                    self.centerContent()
+                    self.lockContentOffsetToCenter()
+                }
+            }
         }
         
         /// Pulls the camera intrinsics from the pixel buffer.  The intrinsics are needed to compute the
