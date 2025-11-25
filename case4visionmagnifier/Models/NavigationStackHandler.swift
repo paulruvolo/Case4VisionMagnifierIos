@@ -27,14 +27,13 @@ enum NavigationDestinations: Hashable {
 
 /// This is a class that can be used for managing the navigation stack
 class NavigationStackHandler: ObservableObject {
-    static var shared = NavigationStackHandler()
     @Published var path: [NavigationDestinations] {
         didSet {
             print("navstack \(path.count)")
         }
     }
     
-    private init() {
+    init() {
         path = []
     }
 

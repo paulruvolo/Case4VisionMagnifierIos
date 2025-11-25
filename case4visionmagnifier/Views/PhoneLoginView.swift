@@ -8,7 +8,7 @@
 import SwiftUI
 
 struct PhoneLoginView: View {
-    @ObservedObject var stackHandler = NavigationStackHandler.shared
+    @StateObject var stackHandler = NavigationStackHandler()
 
     var body: some View {
         NavigationStack(path: $stackHandler.path) {
@@ -19,6 +19,7 @@ struct PhoneLoginView: View {
                 destination.asView
             }
         }
+        .environmentObject(stackHandler)
     }
 }
 
@@ -26,6 +27,7 @@ struct EnterPhoneNumberView: View {
     @State private var phoneNumber: String = ""
     @State private var errorMessage: String?
     @State private var isLoading = false
+    @EnvironmentObject var stackHandler: NavigationStackHandler
 
     var body: some View {
         VStack(spacing: 24) {
@@ -83,7 +85,7 @@ struct EnterPhoneNumberView: View {
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
             isLoading = false
             print("PUSHING VIEW! verify phone number")
-            NavigationStackHandler.shared.pushView(.verifyPhoneNumber)
+            stackHandler.pushView(.verifyPhoneNumber)
         }
     }
 }

@@ -11,20 +11,22 @@ import FirebaseFirestore
 class AuthHandler: ObservableObject {
     static var shared = AuthHandler()
     private var lastVerificationID: String?
-    public static let testSignInFlow = true
+    public static let testSignInFlow = false
     /// Handle to Firebase authentication
     private var firebaseAuth: Auth?
     var activationCode: String?
 
     @Published private(set) var currentUID: String? = nil
+    @Published private(set) var isActivated: Bool = false
     
     func createAuthHandle() {
-       firebaseAuth = Auth.auth()
+        firebaseAuth = Auth.auth()
         currentUID = firebaseAuth?.currentUser?.uid
         createAuthListener()
         if Self.testSignInFlow {
             try! Auth.auth().signOut()
         }
+        checkForActivation(uid: currentUID)
     }
     
     func getVerificationCode(phoneNumber: String) {
@@ -44,17 +46,47 @@ class AuthHandler: ObservableObject {
         firebaseAuth?.addStateDidChangeListener() { (auth, user) in
             DispatchQueue.main.async {
                 self.currentUID = user?.uid
+                if !self.isActivated, let currentUID = self.currentUID {
+                    self.checkForActivation(uid: currentUID)
+                }
                 print("currentUID \(self.currentUID ?? "nil")")
             }
         }
     }
     
+    private func checkForActivation(uid: String?) {
+        if ActivationStore.isActivated() {
+            self.isActivated = true
+            return
+        }
+        // check the database
+        if let uid {
+            Firestore.firestore().collection("users").document(uid).getDocument() { document, error in
+                if let error {
+                    print("error getting document: \(error)")
+                    return
+                }
+                guard let data = document?.data() else {
+                    print("no document found")
+                    return
+                }
+                // as long as there is a value there we count it as valid
+                if data["activation"] != nil {
+                    print("activating")
+                    self.isActivated = true
+                }
+            }
+        }
+        
+    }
+    
     private init() {
         currentUID = nil
+        isActivated = ActivationStore.isActivated()
     }
     
     func recordActivationInKeyChain() {
-        print("recording activation")
+        ActivationStore.setActivated(true)
     }
     
     func attemptSignIn(verificationCode: String) async->Bool {

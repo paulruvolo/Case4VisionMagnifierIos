@@ -57,23 +57,37 @@ struct case4visionmagnifierApp: App {
     @ObservedObject var authHandler = AuthHandler.shared
     @State var activating = false
     @State var code: String?
+    @State var promptToScanCodeOrBuyProduct = false
     
+    init() {
+        // Ensure trial is started at first launch / whatever trigger you want
+        TrialStore.startTrialIfNeeded()
+    }
     var body: some Scene {
+        let trialExpired = TrialStore.isTrialExpired(days: 7)
+
         WindowGroup {
             Group {
-                if !activating {
-                    RearWideCameraView()
-                } else {
+                if activating {
                     if authHandler.currentUID == nil {
                         PhoneLoginView()
                     }
+                } else if promptToScanCodeOrBuyProduct || trialExpired && !authHandler.isActivated {
+                    Text("To Continue Using the App, Either Scan Your Activation QR Code that Came With Case4Vision or Buy the Full Version of the App")
+                        .font(.largeTitle)
+                        .bold()
+                } else {
+                    RearWideCameraView()
                 }
             }
-            // This is for universal links
-             .onContinueUserActivity(NSUserActivityTypeBrowsingWeb) { activity in
+            .onContinueUserActivity(NSUserActivityTypeBrowsingWeb) { activity in
                  guard let url = activity.webpageURL else { return }
                  let components = URLComponents(url: url, resolvingAgainstBaseURL: false)
                  if let code = components?.queryItems?.first(where: { $0.name == "code" })?.value {
+                     guard !authHandler.isActivated else {
+                         // already activated
+                         return
+                     }
                      self.code = code
                      if authHandler.currentUID != nil {
                          Task {
@@ -85,12 +99,16 @@ struct case4visionmagnifierApp: App {
                              }
                          }
                      } else {
+                         promptToScanCodeOrBuyProduct = false
                          activating = true
                      }
                  }
              }
              .onChange(of: authHandler.currentUID) { (_, newValue) in
-                 guard let code else { return }
+                 guard let code else {
+                     promptToScanCodeOrBuyProduct = true
+                     return
+                 }
                  
                  Task {
                      if await authHandler.associateCodeWithAccount(code: code) {
