@@ -103,8 +103,9 @@ struct TrialStore {
             return // already started
         }
         let now = Date()
-        let seconds = now.timeIntervalSince1970
-        let data = withUnsafeBytes(of: seconds.bitPattern.littleEndian) { Data($0) }
+        let seconds = Double(now.timeIntervalSince1970)
+        let data = withUnsafeBytes(of: seconds) { Data($0) }
+        print("starting trial if needed \(seconds)")
         KeychainHelper.shared.set(data, forKey: key)
     }
 
@@ -114,8 +115,7 @@ struct TrialStore {
               data.count == MemoryLayout<UInt64>.size else {
             return nil
         }
-        let value = data.withUnsafeBytes { $0.load(as: UInt64.self) }
-        let seconds = TimeInterval(UInt64(littleEndian: value))
+        let seconds = data.withUnsafeBytes { $0.load(as: Double.self) }
         return Date(timeIntervalSince1970: seconds)
     }
 

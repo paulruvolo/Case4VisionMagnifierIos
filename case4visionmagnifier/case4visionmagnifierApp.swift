@@ -72,7 +72,7 @@ struct case4visionmagnifierApp: App {
                     if authHandler.currentUID == nil {
                         PhoneLoginView()
                     }
-                } else if promptToScanCodeOrBuyProduct || trialExpired && !authHandler.isActivated {
+                } else if promptToScanCodeOrBuyProduct || (trialExpired || AuthHandler.disableUsageDuringTrial) && !authHandler.isActivated {
                     Text("To Continue Using the App, Either Scan Your Activation QR Code that Came With Case4Vision or Buy the Full Version of the App")
                         .font(.largeTitle)
                         .bold()

@@ -11,7 +11,11 @@ import FirebaseFirestore
 class AuthHandler: ObservableObject {
     static var shared = AuthHandler()
     private var lastVerificationID: String?
+    
+    // useful for testing
     public static let testSignInFlow = false
+    public static let disableUsageDuringTrial = false
+
     /// Handle to Firebase authentication
     private var firebaseAuth: Auth?
     var activationCode: String?
@@ -24,6 +28,7 @@ class AuthHandler: ObservableObject {
         currentUID = firebaseAuth?.currentUser?.uid
         createAuthListener()
         if Self.testSignInFlow {
+            ActivationStore.setActivated(false)
             try! Auth.auth().signOut()
         }
         checkForActivation(uid: currentUID)
