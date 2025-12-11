@@ -431,7 +431,7 @@
 				CODE_SIGN_ENTITLEMENTS = case4visionmagnifier/case4visionmagnifier.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = 787TUDMR8Q;
+				DEVELOPMENT_TEAM = U9N7WP2WN5;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = case4visionmagnifier/Info.plist;
@@ -449,7 +449,7 @@
 				);
 				MARKETING_VERSION = 1.0;
 				OTHER_LDFLAGS = "-ObjC";
-				PRODUCT_BUNDLE_IDENTIFIER = edu.occamlab.case4visionmagnifier;
+				PRODUCT_BUNDLE_IDENTIFIER = com.caseforvision.closeup;
 				PRODUCT_NAME = CLOSEUP;
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_VERSION = 5.0;
@@ -465,7 +465,7 @@
 				CODE_SIGN_ENTITLEMENTS = case4visionmagnifier/case4visionmagnifier.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = 787TUDMR8Q;
+				DEVELOPMENT_TEAM = U9N7WP2WN5;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = case4visionmagnifier/Info.plist;
@@ -483,7 +483,7 @@
 				);
 				MARKETING_VERSION = 1.0;
 				OTHER_LDFLAGS = "-ObjC";
-				PRODUCT_BUNDLE_IDENTIFIER = edu.occamlab.case4visionmagnifier;
+				PRODUCT_BUNDLE_IDENTIFIER = com.caseforvision.closeup;
 				PRODUCT_NAME = CLOSEUP;
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_VERSION = 5.0;
