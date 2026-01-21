@@ -31,24 +31,32 @@ struct case4visionmagnifierApp: App {
     @State var activating = false
     @State var code: String?
     @State var promptToScanCodeOrBuyProduct = false
+    @ObservedObject var iapManager = IAPManager.shared
     
     init() {
         // Ensure trial is started at first launch / whatever trigger you want
         TrialStore.startTrialIfNeeded()
     }
     var body: some Scene {
-        let trialExpired = TrialStore.isTrialExpired(days: 14)
-
+        // only for testing
+        let trialExpired = TrialStore.isTrialExpired(days: 0)
         WindowGroup {
-            Group {
-                if !IAPManager.shared.isPurchased && (promptToScanCodeOrBuyProduct || trialExpired) {
-                    Text("To Continue Using the App, Either Scan Your QR Code that Came With CaseForVision or Purchase Full Usage of the App Below")
-                        .font(.largeTitle)
-                        .bold()
-                    PurchaseView()
-                } else {
-                    RearWideCameraView()
+            if !iapManager.isPurchased && (promptToScanCodeOrBuyProduct || trialExpired) {
+                ScrollView {
+                    VStack(spacing: 16) {
+                        Text("To Continue Using the App, Either Scan Your QR Code that Came With CaseForVision or Purchase Full Usage of the App Below")
+                            .font(.largeTitle)
+                            .bold()
+                            .multilineTextAlignment(.center)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .frame(maxWidth: .infinity)
+
+                        PurchaseView()
+                    }
+                    .padding()
                 }
+            } else {
+                RearWideCameraView()
             }
         }
     }

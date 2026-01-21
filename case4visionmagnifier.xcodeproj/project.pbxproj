@@ -8,7 +8,6 @@
 
 /* Begin PBXBuildFile section */
 		8204E52A2F0C326A0047EF6A /* StoreKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 8204E5292F0C326A0047EF6A /* StoreKit.framework */; };
-		82BD02B42EC3C3930023EEC1 /* GoogleService-Info.plist in Resources */ = {isa = PBXBuildFile; fileRef = 82BD02B32EC3C3930023EEC1 /* GoogleService-Info.plist */; };
 		82D36F172E85AF7900EA77AF /* Settings.bundle in Resources */ = {isa = PBXBuildFile; fileRef = 82D36F162E85AF7900EA77AF /* Settings.bundle */; };
 /* End PBXBuildFile section */
 
@@ -34,7 +33,6 @@
 		826FB5102E4CE6D50009BB77 /* qplusplus.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = qplusplus.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		826FB51D2E4CE6D60009BB77 /* case4visionmagnifierTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = case4visionmagnifierTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		826FB5272E4CE6D60009BB77 /* case4visionmagnifierUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = case4visionmagnifierUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
-		82BD02B32EC3C3930023EEC1 /* GoogleService-Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = "GoogleService-Info.plist"; sourceTree = "<group>"; };
 		82D36F162E85AF7900EA77AF /* Settings.bundle */ = {isa = PBXFileReference; lastKnownFileType = "wrapper.plug-in"; path = Settings.bundle; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
@@ -111,7 +109,6 @@
 				826FB5202E4CE6D60009BB77 /* case4visionmagnifierTests */,
 				826FB52A2E4CE6D60009BB77 /* case4visionmagnifierUITests */,
 				826FB5112E4CE6D50009BB77 /* Products */,
-				82BD02B32EC3C3930023EEC1 /* GoogleService-Info.plist */,
 				8204E51F2F08503C0047EF6A /* Frameworks */,
 			);
 			sourceTree = "<group>";
@@ -249,7 +246,6 @@
 			buildActionMask = 2147483647;
 			files = (
 				82D36F172E85AF7900EA77AF /* Settings.bundle in Resources */,
-				82BD02B42EC3C3930023EEC1 /* GoogleService-Info.plist in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

@@ -14,7 +14,7 @@ struct PurchaseView: View {
 
     var body: some View {
         VStack(spacing: 16) {
-            Text("CloseUp Full License")
+            Text("Q++ Full License")
                 .font(.title)
                 .bold()
 
