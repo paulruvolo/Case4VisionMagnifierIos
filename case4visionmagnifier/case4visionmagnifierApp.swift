@@ -38,8 +38,7 @@ struct case4visionmagnifierApp: App {
         TrialStore.startTrialIfNeeded()
     }
     var body: some Scene {
-        // only for testing
-        let trialExpired = TrialStore.isTrialExpired(days: 0)
+        let trialExpired = TrialStore.isTrialExpired(days: 14)
         WindowGroup {
             if !iapManager.isPurchased && (promptToScanCodeOrBuyProduct || trialExpired) {
                 ScrollView {
