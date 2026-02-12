@@ -30,7 +30,7 @@
 			<key>Key</key>
 			<string>minimumMagnification</string>
 			<key>DefaultValue</key>
-			<integer>3</integer>
+			<real>1.5</real>
 		</dict>
 	</array>
 </dict>

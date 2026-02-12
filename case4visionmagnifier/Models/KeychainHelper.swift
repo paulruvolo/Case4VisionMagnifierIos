@@ -120,14 +120,24 @@ struct TrialStore {
     }
 
     /// True if we have a trial and it's older than `days` days.
-    static func isTrialExpired(days: Int = 7) -> Bool {
+    static func isTrialExpired() -> Bool {
         guard let start = getTrialStartDate() else {
             // If no start date, treat as not started (or expired, your choice)
             return false
         }
         let elapsed = Date().timeIntervalSince(start)
-        let limit = TimeInterval(days * 24 * 60 * 60)
+        let limit = TimeInterval(case4visionmagnifierApp.trialLimit * 24 * 60 * 60)
         return elapsed >= limit
+    }
+    
+    static func trialDaysLeft() -> Int {
+        guard let start = getTrialStartDate() else {
+            return 0
+        }
+        let elapsed = Date().timeIntervalSince(start)
+        let limit: TimeInterval = 24 * 60 * 60 * Double(case4visionmagnifierApp.trialLimit)
+        let remaining = (limit - elapsed)
+        return Int(round(remaining / 24.0 / 60.0 / 60.0))
     }
 
     /// For debugging / reset

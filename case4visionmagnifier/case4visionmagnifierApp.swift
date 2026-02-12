@@ -32,13 +32,16 @@ struct case4visionmagnifierApp: App {
     @State var code: String?
     @State var promptToScanCodeOrBuyProduct = false
     @ObservedObject var iapManager = IAPManager.shared
+    static let trialLimit = 14
+    @State var showAlert = false
+    @AppStorage("lastWarned") var lastWarned: Int?
     
     init() {
         // Ensure trial is started at first launch / whatever trigger you want
         TrialStore.startTrialIfNeeded()
     }
     var body: some Scene {
-        let trialExpired = TrialStore.isTrialExpired(days: 14)
+        let trialExpired = TrialStore.isTrialExpired()
         WindowGroup {
             if !iapManager.isPurchased && (promptToScanCodeOrBuyProduct || trialExpired) {
                 ScrollView {
@@ -55,8 +58,33 @@ struct case4visionmagnifierApp: App {
                     .padding()
                 }
             } else {
-                RearWideCameraView()
+                RearWideCameraView().onAppear {
+                    guard !iapManager.isPurchased else {
+                        return
+                    }
+                    guard let lastWarned else {
+                        warnAboutTrial()
+                        return
+                    }
+                    let trialRemaining = TrialStore.trialDaysLeft()
+                    if trialRemaining < lastWarned {
+                        warnAboutTrial()
+                    }
+                }.alert("You are using a trial version of the Q++", isPresented: $showAlert) {
+                    Button("OK", role: .cancel) {
+                        
+                    }
+                } message: {
+                    Text("Your trial will expire in \(TrialStore.trialDaysLeft()) days. If you bought Case for Vision, scan your code to activate the full version.")
+                }
             }
+        }
+
+    }
+    func warnAboutTrial() {
+        DispatchQueue.main.async {
+            self.lastWarned = TrialStore.trialDaysLeft()
+            showAlert = true
         }
     }
 }
