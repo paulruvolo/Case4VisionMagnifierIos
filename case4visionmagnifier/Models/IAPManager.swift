@@ -19,21 +19,30 @@ final class IAPManager: ObservableObject {
     @Published private(set) var isPurchased: Bool = false
     @Published private(set) var isLoading: Bool = false
     @Published internal(set) var lastErrorMessage: String?
-
-    private var updatesTask: Task<Void, Never>?
-
+    
+    // These are safe to cancel from any context (incl. deinit), so don’t isolate them.
+    nonisolated(unsafe) private var updatesTask: Task<Void, Never>?
+    nonisolated(unsafe) private var startupTask: Task<Void, Never>?
+    
     private init() {
-        // Start listening immediately (important)
+        // After stored properties are in a valid initial state, it’s legal to use self.
         updatesTask = listenForTransactions()
 
-        Task {
-            await refreshPurchasedState()
-            await loadProduct()
+        startupTask = Task { [weak self] in
+            guard let self else { return }
+            await self.refreshPurchasedState()
+            await self.loadProduct()
         }
     }
 
+    /// Call this from outside to wait until purchase state + product are loaded.
+    func ready() async {
+        _ = await startupTask?.value
+    }
+    
     deinit {
         updatesTask?.cancel()
+        startupTask?.cancel()
     }
 
     func loadProduct() async {

@@ -59,16 +59,19 @@ struct case4visionmagnifierApp: App {
                 }
             } else {
                 RearWideCameraView().onAppear {
-                    guard !iapManager.isPurchased else {
-                        return
-                    }
-                    guard let lastWarned else {
-                        warnAboutTrial()
-                        return
-                    }
-                    let trialRemaining = TrialStore.trialDaysLeft()
-                    if trialRemaining < lastWarned {
-                        warnAboutTrial()
+                    Task {
+                        await iapManager.ready()
+                        guard !iapManager.isPurchased else {
+                            return
+                        }
+                        guard let lastWarned else {
+                            warnAboutTrial()
+                            return
+                        }
+                        let trialRemaining = TrialStore.trialDaysLeft()
+                        if trialRemaining < lastWarned {
+                            warnAboutTrial()
+                        }
                     }
                 }.alert("You are using a trial version of the Q++", isPresented: $showAlert) {
                     Button("OK", role: .cancel) {

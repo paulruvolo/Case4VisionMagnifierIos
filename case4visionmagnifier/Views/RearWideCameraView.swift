@@ -994,6 +994,7 @@ final class CameraModel: ObservableObject {
         // Choose the highest-resolution format supported by the device’s rear wide camera.
         // We’ll also pick the highest max frame rate available within that format.
         let best = bestFormatAndFrameRate(for: device)
+        print("best format \(best)")
         try device.lockForConfiguration()
         device.activeFormat = best.format
         if let fps = best.maxFPS {
@@ -1034,6 +1035,11 @@ final class CameraModel: ObservableObject {
             device.isSmoothAutoFocusEnabled = false
         }
         
+        if device.activeFormat.isVideoHDRSupported {
+            device.automaticallyAdjustsVideoHDREnabled = false
+            device.isVideoHDREnabled = false
+        }
+        
         device.unlockForConfiguration()
         // Add a dummy output so the session can run even if you later want to add data/video outputs.
         // For preview-only, this isn’t required, but harmless.
@@ -1050,8 +1056,9 @@ final class CameraModel: ObservableObject {
     
     /// Find the format with the largest pixel dimensions; within that, capture the highest supported max FPS.
     private static func bestFormatAndFrameRate(for device: AVCaptureDevice) -> (format: AVCaptureDevice.Format, maxFPS: Double?) {
+        let sixtyFPSPlus = device.formats.filter({$0.videoSupportedFrameRateRanges.map(\.maxFrameRate).max() ?? 0 >= 60})
         // Sort formats by area (width * height), then by highest supported max frame rate.
-        let sorted = device.formats.sorted { a, b in
+        let sorted = sixtyFPSPlus.sorted { a, b in
             let da = CMVideoFormatDescriptionGetDimensions(a.formatDescription)
             let db = CMVideoFormatDescriptionGetDimensions(b.formatDescription)
             let areaA = Int(da.width) * Int(da.height)
