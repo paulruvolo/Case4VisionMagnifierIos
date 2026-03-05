@@ -1002,32 +1002,35 @@ final class CameraModel: ObservableObject {
             device.activeVideoMinFrameDuration = duration
             device.activeVideoMaxFrameDuration = duration
         }
-        
-        // 1) Use continuous AF (keeps adjusting on its own)
-        if device.isFocusModeSupported(.continuousAutoFocus) {
-            device.focusMode = .continuousAutoFocus
-        }
 
         // 2) Aim AF at the optical center of the active sensor
         // (Normalized coordinates: (0,0)=top-left, (1,1)=bottom-right in
-        // landscape-right sensor space. Center is always 0.5,0.5.)
         if device.isFocusPointOfInterestSupported {
             print("biasing towards center")
-            device.focusPointOfInterest = CGPoint(x: 0.5, y: 0.5)
+            // Note: setting to 0.5, 0.5 doesn't work.  Needs to be different than 0.5
+            device.focusPointOfInterest = CGPoint(x: 0.5, y: 0.48)
         }
-
+        
+        // 1) Use continuous AF (keeps adjusting on its own)
+        if device.isFocusModeSupported(.continuousAutoFocus) {
+            print("setting continuous auto focus")
+            device.focusMode = .continuousAutoFocus
+        }
+        
         // 3) Bias AF range toward close subjects
         if device.isAutoFocusRangeRestrictionSupported {
             print("biasing near focus")
             device.autoFocusRangeRestriction = .near
         }
-        if device.isExposurePointOfInterestSupported {
-            // set exposure point in the upper right to avoid darkening parts of the image too much
-            device.exposurePointOfInterest = CGPoint(x: 1.0, y: 0.0)
-        }
+        
         if device.isExposureModeSupported(.continuousAutoExposure) {
             device.exposureMode = .continuousAutoExposure
         }
+        
+//        if device.isExposurePointOfInterestSupported {
+//            // set exposure point in the upper right to avoid darkening parts of the image too much
+//            device.exposurePointOfInterest = CGPoint(x: 1.0, y: 0.0)
+//        }
 
         // 4) No need for smooth AF
         if device.isSmoothAutoFocusSupported {
@@ -1056,9 +1059,9 @@ final class CameraModel: ObservableObject {
     
     /// Find the format with the largest pixel dimensions; within that, capture the highest supported max FPS.
     private static func bestFormatAndFrameRate(for device: AVCaptureDevice) -> (format: AVCaptureDevice.Format, maxFPS: Double?) {
-        let sixtyFPSPlus = device.formats.filter({$0.videoSupportedFrameRateRanges.map(\.maxFrameRate).max() ?? 0 >= 60})
+        let thirtyFPSPlus = device.formats.filter({$0.videoSupportedFrameRateRanges.map(\.maxFrameRate).max() ?? 0 >= 30 })
         // Sort formats by area (width * height), then by highest supported max frame rate.
-        let sorted = sixtyFPSPlus.sorted { a, b in
+        let sorted = thirtyFPSPlus.sorted { a, b in
             let da = CMVideoFormatDescriptionGetDimensions(a.formatDescription)
             let db = CMVideoFormatDescriptionGetDimensions(b.formatDescription)
             let areaA = Int(da.width) * Int(da.height)
