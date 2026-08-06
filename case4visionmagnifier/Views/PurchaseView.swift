@@ -35,16 +35,6 @@ struct PurchaseView: View {
                     .buttonStyle(.borderedProminent)
                     .disabled(iap.isLoading)
 
-                    // ✅ NEW: Redeem Offer/Promo Code via Apple's system sheet
-                    Button {
-                        Task { await redeemOfferCode() }
-                    } label: {
-                        Text("Redeem Offer Code")
-                            .frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.bordered)
-                    .disabled(iap.isLoading)
-
                     Button {
                         Task { await iap.restorePurchases() }
                     } label: {
